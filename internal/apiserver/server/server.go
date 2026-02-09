@@ -33,6 +33,7 @@ import (
 	"github.com/llm-d-incubation/batch-gateway/internal/apiserver/middleware"
 	mockdb "github.com/llm-d-incubation/batch-gateway/internal/database/mock"
 	mockfiles "github.com/llm-d-incubation/batch-gateway/internal/files_store/mock"
+	"github.com/llm-d-incubation/batch-gateway/internal/shared/openai"
 	"k8s.io/klog/v2"
 )
 
@@ -123,7 +124,8 @@ func (s *Server) buildHandler() http.Handler {
 	mux := http.NewServeMux()
 
 	// TODO: change to actual implementation
-	dbClient := mockdb.NewMockBatchDBClient()
+	batchDBClient := mockdb.NewMockDBClient[openai.Batch](func(b openai.Batch) string { return b.ID })
+	fileDBClient := mockdb.NewMockDBClient[openai.FileObject](func(f openai.FileObject) string { return f.ID })
 	eventClient := mockdb.NewMockBatchEventChannelClient()
 	queueClient := mockdb.NewMockBatchPriorityQueueClient()
 	statusClient := mockdb.NewMockBatchStatusClient()
@@ -132,8 +134,8 @@ func (s *Server) buildHandler() http.Handler {
 	// register handlers
 	healthHandler := health.NewHealthApiHandler()
 	metricsHandler := metrics.NewMetricsApiHandler()
-	fileHandler := file.NewFileApiHandler(s.config, dbClient, filesClient)
-	batchHandler := batch.NewBatchApiHandler(s.config, dbClient, queueClient, eventClient, statusClient)
+	fileHandler := file.NewFileApiHandler(s.config, fileDBClient, filesClient)
+	batchHandler := batch.NewBatchApiHandler(s.config, batchDBClient, queueClient, eventClient, statusClient)
 
 	handlers := []common.ApiHandler{
 		healthHandler,

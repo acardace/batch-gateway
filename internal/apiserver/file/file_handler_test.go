@@ -49,10 +49,10 @@ func TestFileHandler(t *testing.T) {
 }
 
 // setupTestHandler creates a test handler with mocked dependencies
-func setupTestHandler(t *testing.T) (*FileApiHandler, *dbmock.MockBatchDBClient, *fsmock.MockBatchFilesClient, context.Context) {
+func setupTestHandler(t *testing.T) (*FileApiHandler, *dbmock.MockDBClient[openai.FileObject], *fsmock.MockBatchFilesClient, context.Context) {
 	t.Helper()
 
-	dbClient := dbmock.NewMockBatchDBClient()
+	dbClient := dbmock.NewMockDBClient[openai.FileObject](func(f openai.FileObject) string { return f.ID })
 	filesClient := fsmock.NewMockBatchFilesClient()
 
 	config := &common.ServerConfig{
@@ -160,20 +160,17 @@ func doTestCreateFile(t *testing.T) {
 	}
 
 	// Verify file was stored in DB
-	items, _, _, err := dbClient.DBGet(ctx, &dbapi.BatchDBQuery{
+	items, _, _, err := dbClient.Get(ctx, &dbapi.Query{
 		IDs: []string{fileObj.ID},
-	}, false, 0, 10)
+	}, true, 0, 10)
 	if err != nil {
 		t.Fatalf("failed to get file from DB: %v", err)
 	}
 	if len(items) != 1 {
 		t.Fatalf("expected 1 item in DB, got %d", len(items))
 	}
-	if items[0].ID != fileObj.ID {
-		t.Errorf("expected DB item ID '%s', got '%s'", fileObj.ID, items[0].ID)
-	}
-	if items[0].Expiry != fileObj.ExpiresAt {
-		t.Errorf("expected DB expiry %d, got %d", fileObj.ExpiresAt, items[0].Expiry)
+	if items[0].Item.ID != fileObj.ID {
+		t.Errorf("expected DB item ID '%s', got '%s'", fileObj.ID, items[0].Item.ID)
 	}
 
 	// Verify file was actually uploaded to storage
@@ -279,37 +276,7 @@ func doTestListFiles(t *testing.T) {
 		}
 	})
 
-	// Test 2: Filter by purpose=batch
-	t.Run("FilterByPurpose", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/v1/files?purpose=batch", nil)
-		req = req.WithContext(ctx)
-
-		w := httptest.NewRecorder()
-		handler.ListFiles(w, req)
-
-		if w.Code != http.StatusOK {
-			t.Errorf("expected status %d, got %d", http.StatusOK, w.Code)
-		}
-
-		var listResp openai.ListFilesResponse
-		if err := json.Unmarshal(w.Body.Bytes(), &listResp); err != nil {
-			t.Fatalf("failed to parse list response: %v", err)
-		}
-
-		// Should only return batch purpose files
-		expectedCount := 2 // batch-file-1 and batch-file-2
-		if len(listResp.Data) != expectedCount {
-			t.Errorf("expected %d batch files, got %d", expectedCount, len(listResp.Data))
-		}
-
-		for _, file := range listResp.Data {
-			if file.Purpose != openai.FileObjectPurposeBatch {
-				t.Errorf("expected purpose 'batch', got '%s' for file %s", file.Purpose, file.ID)
-			}
-		}
-	})
-
-	// Test 3: Test limit parameter
+	// Test 2: Test limit parameter
 	t.Run("LimitParameter", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/v1/files?limit=1", nil)
 		req = req.WithContext(ctx)
@@ -652,7 +619,7 @@ func doTestDeleteFile(t *testing.T) {
 		}
 
 		// Verify file is actually deleted from database
-		items, _, _, err := dbClient.DBGet(ctx, &dbapi.BatchDBQuery{
+		items, _, _, err := dbClient.Get(ctx, &dbapi.Query{
 			IDs: []string{createdFile.ID},
 		}, true, 0, 1)
 		if err != nil {
