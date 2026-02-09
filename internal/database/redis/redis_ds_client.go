@@ -66,6 +66,13 @@ var (
 	getByExpiryLua         string
 	redisScriptGetByExpiry = goredis.NewScript(getByExpiryLua)
 
+	// logicalCondNames maps LogicalCond values to their string representations for Redis scripts.
+	logicalCondNames = map[db_api.LogicalCond]string{
+		db_api.LogicalCondNone: "none",
+		db_api.LogicalCondAnd:  "and",
+		db_api.LogicalCondOr:   "or",
+	}
+
 	_ db_api.BatchDBClient            = (*BatchDSClientRedis)(nil)
 	_ db_api.BatchPriorityQueueClient = (*BatchDSClientRedis)(nil)
 	_ db_api.BatchEventChannelClient  = (*BatchDSClientRedis)(nil)
