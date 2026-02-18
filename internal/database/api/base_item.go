@@ -16,26 +16,23 @@ limitations under the License.
 
 package api
 
-import "fmt"
+// BaseIndexes contains common indexed fields for all database items.
+// These fields are used for querying and filtering.
+type BaseItem struct {
+	ID string
 
-// FileItem is the database item type
-type FileItem struct {
-	BaseItem
+	// TenantID is the identifier for multi-tenancy support.
+	TenantID string
 
-	// Purpose is the intended purpose of the file (e.g., "batch", "batch_output").
-	Purpose string
-}
+	// Expiry is the Unix timestamp (in seconds) when the item expires.
+	Expiry int64
 
-// FileDBClient is the typed database client for file objects.
-type FileDBClient = DBClient[FileItem]
+	// Tags are key-value pairs that enable filtering items based on their contents.
+	Tags Tags
 
-// Validate validates a FileItem for required fields.
-func (f *FileItem) Validate() error {
-	if f == nil {
-		return fmt.Errorf("item is nil")
-	}
-	if len(f.ID) == 0 {
-		return fmt.Errorf("ID is empty")
-	}
-	return nil
+	// Spec contains the serialized specification/static data.
+	Spec []byte
+
+	// Status contains the serialized status/dynamic data.
+	Status []byte
 }

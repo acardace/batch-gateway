@@ -30,12 +30,13 @@ import (
 	"github.com/llm-d-incubation/batch-gateway/internal/apiserver/common"
 	dbapi "github.com/llm-d-incubation/batch-gateway/internal/database/api"
 	mockapi "github.com/llm-d-incubation/batch-gateway/internal/database/mock"
+	"github.com/llm-d-incubation/batch-gateway/internal/shared/converter"
 	"github.com/llm-d-incubation/batch-gateway/internal/shared/openai"
 )
 
 func setupBatchApiHandlerForTest() *BatchApiHandler {
 	config := &common.ServerConfig{}
-	dbClient := mockapi.NewMockDBClient(func(b openai.Batch) string { return b.ID })
+	dbClient := mockapi.NewMockDBClient[dbapi.BatchItem](func(b *dbapi.BatchItem) string { return b.ID })
 	eventClient := mockapi.NewMockBatchEventChannelClient()
 	queueClient := mockapi.NewMockBatchPriorityQueueClient()
 	statusClient := mockapi.NewMockBatchStatusClient()
@@ -122,11 +123,11 @@ func TestBatchHandler(t *testing.T) {
 				},
 			},
 		}
-		dbClient.Store(context.Background(), &dbapi.BatchItem{
-			TenantID: common.DefaultTenantID,
-			Tags:     map[string]string{},
-			Item:     batch,
-		})
+		item, err := converter.BatchToDBItem(&batch, common.DefaultTenantID, map[string]string{})
+		if err != nil {
+			t.Fatalf("Failed to convert batch to DB item: %v", err)
+		}
+		dbClient.Store(context.Background(), item)
 
 		// get batch
 		req := httptest.NewRequest(http.MethodGet, "/v1/batches/"+batchID, nil)
@@ -178,11 +179,11 @@ func TestBatchHandler(t *testing.T) {
 					},
 				},
 			}
-			dbClient.Store(context.Background(), &dbapi.BatchItem{
-				TenantID: common.DefaultTenantID,
-				Tags:     map[string]string{},
-				Item:     batch,
-			})
+			item, err := converter.BatchToDBItem(&batch, common.DefaultTenantID, map[string]string{})
+			if err != nil {
+				t.Fatalf("Failed to convert batch to DB item: %v", err)
+			}
+			dbClient.Store(context.Background(), item)
 		}
 
 		// list batches
@@ -247,11 +248,11 @@ func TestBatchHandler(t *testing.T) {
 				},
 			},
 		}
-		dbClient.Store(context.Background(), &dbapi.BatchItem{
-			TenantID: common.DefaultTenantID,
-			Tags:     map[string]string{},
-			Item:     batch,
-		})
+		item, err := converter.BatchToDBItem(&batch, common.DefaultTenantID, map[string]string{})
+		if err != nil {
+			t.Fatalf("Failed to convert batch to DB item: %v", err)
+		}
+		dbClient.Store(context.Background(), item)
 
 		req := httptest.NewRequest(http.MethodPost, "/v1/batches/"+batchID+"/cancel", nil)
 		req.SetPathValue("batch_id", batchID)
@@ -325,11 +326,11 @@ func BenchmarkBatchHandler(b *testing.B) {
 				},
 			},
 		}
-		dbClient.Store(context.Background(), &dbapi.BatchItem{
-			TenantID: common.DefaultTenantID,
-			Tags:     map[string]string{},
-			Item:     batch,
-		})
+		item, err := converter.BatchToDBItem(&batch, common.DefaultTenantID, map[string]string{})
+		if err != nil {
+			b.Fatalf("Failed to convert batch to DB item: %v", err)
+		}
+		dbClient.Store(context.Background(), item)
 
 		b.ResetTimer()
 		for b.Loop() {
@@ -363,11 +364,11 @@ func BenchmarkBatchHandler(b *testing.B) {
 					},
 				},
 			}
-			dbClient.Store(context.Background(), &dbapi.BatchItem{
-				TenantID: common.DefaultTenantID,
-				Tags:     map[string]string{},
-				Item:     batch,
-			})
+			item, err := converter.BatchToDBItem(&batch, common.DefaultTenantID, map[string]string{})
+			if err != nil {
+				b.Fatalf("Failed to convert batch to DB item: %v", err)
+			}
+			dbClient.Store(context.Background(), item)
 		}
 
 		b.ResetTimer()
@@ -402,11 +403,11 @@ func BenchmarkBatchHandler(b *testing.B) {
 					},
 				},
 			}
-			dbClient.Store(context.Background(), &dbapi.BatchItem{
-				TenantID: common.DefaultTenantID,
-				Tags:     map[string]string{},
-				Item:     batch,
-			})
+			item, err := converter.BatchToDBItem(&batch, common.DefaultTenantID, map[string]string{})
+			if err != nil {
+				b.Fatalf("Failed to convert batch to DB item: %v", err)
+			}
+			dbClient.Store(context.Background(), item)
 			b.StartTimer()
 
 			req := httptest.NewRequest(http.MethodPost, "/v1/batches/"+batchID+"/cancel", nil)

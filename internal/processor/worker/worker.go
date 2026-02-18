@@ -154,8 +154,8 @@ func (p *Processor) RunPollingLoop(ctx context.Context) error {
 			continue
 		}
 
-		// TODO:: get tenant id from job.Item
-		// tenantID := "unknown"
+		// TODO:: get tenant id from job
+		// tenantID := job.TenantID
 		// TODO:: job queue object should have enqueued at field (maybe updated at too)
 		// TODO:: metrics.RecordQueueWait(time.Since(task.EnqueuedAt), tenantID)
 
@@ -234,7 +234,7 @@ func (p *Processor) getJobData(ctx context.Context, task *db.BatchJobPriority) (
 // TODO:: add output file closing (output file closing)
 func (p *Processor) processJob(ctx context.Context, workerId int, job *db.BatchItem) {
 	// logger and ctx
-	logger := klog.FromContext(ctx).WithValues("jobID", job.Item.ID, "workerID", workerId)
+	logger := klog.FromContext(ctx).WithValues("jobID", job.ID, "workerID", workerId)
 	jobctx := klog.NewContext(ctx, logger)
 
 	// metrics
@@ -256,11 +256,11 @@ func (p *Processor) processJob(ctx context.Context, workerId int, job *db.BatchI
 	}()
 
 	// status update - inprogress (TTL 24h)
-	p.clients.status.StatusSet(jobctx, job.Item.ID, 24*60*60, []byte(batch.StatusInProgress))
-	logger.V(logging.DEBUG).Info("Worker started job", "workerID", workerId, "jobID", job.Item.ID)
+	p.clients.status.StatusSet(jobctx, job.ID, 24*60*60, []byte(batch.StatusInProgress))
+	logger.V(logging.DEBUG).Info("Worker started job", "workerID", workerId, "jobID", job.ID)
 
 	// TODO:: file validating
-	p.clients.status.StatusSet(jobctx, job.Item.ID, 24*60*60, []byte(batch.StatusValidating))
+	p.clients.status.StatusSet(jobctx, job.ID, 24*60*60, []byte(batch.StatusValidating))
 
 	// TODO:: download file, streaming
 	// check if the method in the request is allowed
@@ -346,19 +346,19 @@ func (p *Processor) processJob(ctx context.Context, workerId int, job *db.BatchI
 	// failed status is used when the file is not valid or the batch request is not started properly
 	finalStatus := batch.StatusCompleted
 	if !metadata.Validate() {
-		logger.V(logging.WARNING).Info("Job finished with partial failures", "jobID", job.Item.ID, "metadata", metadata)
+		logger.V(logging.WARNING).Info("Job finished with partial failures", "jobID", job.ID, "metadata", metadata)
 		// TODO:: finalStatus = batch.Failed
 	}
 
 	// status update
-	p.clients.status.StatusSet(jobctx, job.Item.ID, 24*60*60, []byte(batch.StatusFinalizing))
+	p.clients.status.StatusSet(jobctx, job.ID, 24*60*60, []byte(batch.StatusFinalizing))
 
 	// db update
 	if err := p.clients.database.Update(jobctx, job); err != nil {
-		logger.V(logging.ERROR).Error(err, "Failed to update final job status in DB", "jobID", job.Item.ID)
+		logger.V(logging.ERROR).Error(err, "Failed to update final job status in DB", "jobID", job.ID)
 	}
-	p.clients.status.StatusSet(jobctx, job.Item.ID, 24*60*60, []byte(finalStatus))
-	logger.V(logging.INFO).Info("Job Processed", "jobID", job.Item.ID, "status", finalStatus)
+	p.clients.status.StatusSet(jobctx, job.ID, 24*60*60, []byte(finalStatus))
+	logger.V(logging.INFO).Info("Job Processed", "jobID", job.ID, "status", finalStatus)
 }
 
 func (p *Processor) handleError(ctx context.Context, err error) {

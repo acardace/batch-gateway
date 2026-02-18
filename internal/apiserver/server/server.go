@@ -31,9 +31,9 @@ import (
 	"github.com/llm-d-incubation/batch-gateway/internal/apiserver/health"
 	"github.com/llm-d-incubation/batch-gateway/internal/apiserver/metrics"
 	"github.com/llm-d-incubation/batch-gateway/internal/apiserver/middleware"
+	"github.com/llm-d-incubation/batch-gateway/internal/database/api"
 	mockdb "github.com/llm-d-incubation/batch-gateway/internal/database/mock"
 	mockfiles "github.com/llm-d-incubation/batch-gateway/internal/files_store/mock"
-	"github.com/llm-d-incubation/batch-gateway/internal/shared/openai"
 	"k8s.io/klog/v2"
 )
 
@@ -124,8 +124,8 @@ func (s *Server) buildHandler() http.Handler {
 	mux := http.NewServeMux()
 
 	// TODO: change to actual implementation
-	batchDBClient := mockdb.NewMockDBClient[openai.Batch](func(b openai.Batch) string { return b.ID })
-	fileDBClient := mockdb.NewMockDBClient[openai.FileObject](func(f openai.FileObject) string { return f.ID })
+	batchDBClient := mockdb.NewMockDBClient[api.BatchItem](func(b *api.BatchItem) string { return b.ID })
+	fileDBClient := mockdb.NewMockDBClient[api.FileItem](func(f *api.FileItem) string { return f.ID })
 	eventClient := mockdb.NewMockBatchEventChannelClient()
 	queueClient := mockdb.NewMockBatchPriorityQueueClient()
 	statusClient := mockdb.NewMockBatchStatusClient()

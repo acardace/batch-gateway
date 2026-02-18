@@ -16,24 +16,22 @@ limitations under the License.
 
 package api
 
-import (
-	"fmt"
+import "fmt"
 
-	"github.com/llm-d-incubation/batch-gateway/internal/shared/openai"
-)
-
-// BatchItem is the database item type for openai.Batch objects.
-type BatchItem = BaseItem[openai.Batch]
+// BatchItem is the database item type
+type BatchItem struct {
+	BaseItem
+}
 
 // BatchDBClient is the typed database client for batch objects.
-type BatchDBClient = DBClient[openai.Batch]
+type BatchDBClient = DBClient[BatchItem]
 
-// IsBatchItemValid validates a BatchItem for required fields.
-func IsBatchItemValid(item *BatchItem) error {
-	if item == nil {
+// Validate validates a BatchItem for required fields.
+func (b *BatchItem) Validate() error {
+	if b == nil {
 		return fmt.Errorf("item is nil")
 	}
-	if len(item.Item.ID) == 0 {
+	if len(b.ID) == 0 {
 		return fmt.Errorf("ID is empty")
 	}
 	return nil

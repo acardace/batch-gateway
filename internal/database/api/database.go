@@ -26,21 +26,20 @@ import (
 	"github.com/llm-d-incubation/batch-gateway/internal/shared/store"
 )
 
-// DBClient is a generic interface for managing Item[T] in persistent storage.
+// DBClient is a generic interface for managing database items in persistent storage.
 //
-// Each domain type (e.g., openai.Batch, openai.FileObject) gets its own
-// typed DBClient implementation. The implementation handles serialization
-// of Item[T].Data internally.
+// Each domain type (e.g., BatchItem, FileItem) gets its own typed DBClient implementation.
+// The implementation handles serialization of item contents internally.
 //
 // Example usage:
 //
-//	type BatchDBClient = api.DBClient[openai.Batch]
-//	type FileDBClient = api.DBClient[openai.FileObject]
+//	type BatchDBClient = api.DBClient[BatchItem]
+//	type FileDBClient = api.DBClient[FileItem]
 type DBClient[T any] interface {
 	store.BatchClientAdmin
 
-	// Store persists an item. The ID is extracted from item.Item.
-	Store(ctx context.Context, item *BaseItem[T]) error
+	// Store persists an item. The ID is extracted from item.ID field.
+	Store(ctx context.Context, item *T) error
 
 	// Get gets the information (static and dynamic) of items.
 	// If IDs are specified, this function will get items by the specified IDs.
@@ -58,13 +57,13 @@ type DBClient[T any] interface {
 	// cursor is an opaque integer that should be given in the next paginated call via the 'start' parameter.
 	// expectMore indicates if there are more items to get.
 	Get(ctx context.Context, query *Query, includeStatic bool, start, limit int) (
-		items []*BaseItem[T], cursor int, expectMore bool, err error)
+		items []*T, cursor int, expectMore bool, err error)
 
 	// Update updates the dynamic parts of an item.
 	// The function will update in the item's record in the database - all the dynamic fields of the item which are not empty
 	// in the given item object.
 	// Any dynamic field that is empty in the given item object - will not be updated in the item's record in the database.
-	Update(ctx context.Context, item *BaseItem[T]) error
+	Update(ctx context.Context, item *T) error
 
 	// Delete removes items by their IDs.
 	Delete(ctx context.Context, ids []string) (deletedIDs []string, err error)

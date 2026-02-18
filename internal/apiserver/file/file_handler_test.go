@@ -49,10 +49,10 @@ func TestFileHandler(t *testing.T) {
 }
 
 // setupTestHandler creates a test handler with mocked dependencies
-func setupTestHandler(t *testing.T) (*FileApiHandler, *dbmock.MockDBClient[openai.FileObject], *fsmock.MockBatchFilesClient, context.Context) {
+func setupTestHandler(t *testing.T) (*FileApiHandler, *dbmock.MockDBClient[dbapi.FileItem], *fsmock.MockBatchFilesClient, context.Context) {
 	t.Helper()
 
-	dbClient := dbmock.NewMockDBClient[openai.FileObject](func(f openai.FileObject) string { return f.ID })
+	dbClient := dbmock.NewMockDBClient[dbapi.FileItem](func(f *dbapi.FileItem) string { return f.ID })
 	filesClient := fsmock.NewMockBatchFilesClient()
 
 	config := &common.ServerConfig{
@@ -169,15 +169,14 @@ func doTestCreateFile(t *testing.T) {
 	if len(items) != 1 {
 		t.Fatalf("expected 1 item in DB, got %d", len(items))
 	}
-	if items[0].Item.ID != fileObj.ID {
-		t.Errorf("expected DB item ID '%s', got '%s'", fileObj.ID, items[0].Item.ID)
+	if items[0].ID != fileObj.ID {
+		t.Errorf("expected DB item ID '%s', got '%s'", fileObj.ID, items[0].ID)
 	}
 
 	// Verify file was actually uploaded to storage
 	// Mock stores files at /tmp/batch-gateway-files/{folderName}/{fileName}
-	// folderName is empty string, so location is just the filename
 	fileName := fileObj.Filename
-	folderName := ""
+	folderName := common.DefaultTenantID
 	fileReader, fileMeta, err := filesClient.Retrieve(ctx, fileName, folderName)
 	if err != nil {
 		t.Fatalf("failed to retrieve file from storage: %v", err)
@@ -631,7 +630,7 @@ func doTestDeleteFile(t *testing.T) {
 		}
 
 		// Verify physical file is deleted from storage
-		_, _, err = filesClient.Retrieve(ctx, createdFile.Filename, "")
+		_, _, err = filesClient.Retrieve(ctx, createdFile.Filename, common.DefaultTenantID)
 		if err == nil {
 			t.Errorf("expected physical file to be deleted, but still exists")
 		}

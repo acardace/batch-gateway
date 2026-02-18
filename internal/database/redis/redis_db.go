@@ -36,24 +36,15 @@ func (c *BatchDSClientRedis) Store(ctx context.Context, item *db_api.BatchItem) 
 		ctx = context.Background()
 	}
 	logger := klog.FromContext(ctx)
-	if err := db_api.IsBatchItemValid(item); err != nil {
+	if err := item.Validate(); err != nil {
 		logger.Error(err, "Store:")
 		return err
 	}
-	id := item.Item.ID
+	id := item.ID
 	logger = logger.WithValues("ID", id)
 
-	// Serialize the static (spec) and dynamic (status) parts separately.
-	specData, err := json.Marshal(item.Item.BatchSpec)
-	if err != nil {
-		logger.Error(err, "Store: spec serialization failed")
-		return err
-	}
-	statusData, err := json.Marshal(item.Item.BatchStatusInfo)
-	if err != nil {
-		logger.Error(err, "Store: status serialization failed")
-		return err
-	}
+	specData := item.Spec
+	statusData := item.Status
 
 	ptags, err := packTags(item.Tags)
 	if err != nil {
@@ -61,11 +52,7 @@ func (c *BatchDSClientRedis) Store(ctx context.Context, item *db_api.BatchItem) 
 		return err
 	}
 
-	// Extract expiry from the domain object for the Redis hash field.
-	var expiry int64
-	if item.Item.ExpiresAt != nil {
-		expiry = *item.Item.ExpiresAt
-	}
+	expiry := item.Expiry
 
 	cctx, ccancel := context.WithTimeout(ctx, c.timeout)
 	defer ccancel()
@@ -91,19 +78,14 @@ func (c *BatchDSClientRedis) Update(ctx context.Context, item *db_api.BatchItem)
 		ctx = context.Background()
 	}
 	logger := klog.FromContext(ctx)
-	if err := db_api.IsBatchItemValid(item); err != nil {
+	if err := item.Validate(); err != nil {
 		logger.Error(err, "Update:")
 		return err
 	}
-	id := item.Item.ID
+	id := item.ID
 	logger = logger.WithValues("ID", id)
 
-	// Serialize only the dynamic part (status).
-	statusData, err := json.Marshal(item.Item.BatchStatusInfo)
-	if err != nil {
-		logger.Error(err, "Update: status serialization failed")
-		return err
-	}
+	statusData := item.Status
 
 	ptags, err := packTags(item.Tags)
 	if err != nil {
@@ -367,8 +349,10 @@ func batchItemFromHget(vals []interface{}, includeStatic bool, logger klog.Logge
 		return nil, nil
 	}
 
-	// vals[1] is expiry — stored as a top-level hash field for Lua-based expiry queries.
-	// The value is also inside the serialized BatchStatusInfo, so we don't need to parse it here.
+	var expiry int64
+	if expiryStr, ok := vals[1].(string); ok && len(expiryStr) > 0 {
+		expiry, _ = strconv.ParseInt(expiryStr, 10, 64)
+	}
 
 	tags, ok := vals[2].(string)
 	if !ok {
@@ -381,26 +365,20 @@ func batchItemFromHget(vals []interface{}, includeStatic bool, logger klog.Logge
 		return nil, err
 	}
 
-	item := &db_api.BatchItem{
-		Tags: nTags,
-	}
-	item.Item.ID = id
+	item := &db_api.BatchItem{}
+	item.ID = id
+	item.Tags = nTags
+	item.Expiry = expiry
 
-	// Deserialize the dynamic status part (always present).
+	// Store the serialized status part (already in []byte form).
 	if statusStr, ok := vals[3].(string); ok && len(statusStr) > 0 {
-		if err := json.Unmarshal([]byte(statusStr), &item.Item.BatchStatusInfo); err != nil {
-			logger.Error(err, "batchItemFromHget: failed to unmarshal BatchStatusInfo")
-			return nil, err
-		}
+		item.Status = []byte(statusStr)
 	}
 
-	// Deserialize the static spec part only if requested.
+	// Store the serialized spec part only if requested.
 	if includeStatic {
 		if specStr, ok := vals[4].(string); ok && len(specStr) > 0 {
-			if err := json.Unmarshal([]byte(specStr), &item.Item.BatchSpec); err != nil {
-				logger.Error(err, "batchItemFromHget: failed to unmarshal BatchSpec")
-				return nil, err
-			}
+			item.Spec = []byte(specStr)
 		}
 	}
 
