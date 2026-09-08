@@ -66,7 +66,6 @@ var (
 
 	_ db_api.BatchPriorityQueueClient = (*ExchangeDBClientRedis)(nil)
 	_ db_api.BatchEventChannelClient  = (*ExchangeDBClientRedis)(nil)
-	_ db_api.BatchStatusClient        = (*ExchangeDBClientRedis)(nil)
 )
 
 type DSClientRedis struct {
