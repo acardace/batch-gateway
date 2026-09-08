@@ -345,7 +345,6 @@ func TestWatchCancel_SetsFlag_CancelsInferContext(t *testing.T) {
 	ctx := testLoggerCtx(t)
 
 	dbClient := newSpyBatchDB(newMockBatchDBClient())
-	statusClient := mockdb.NewMockBatchStatusClient()
 	eventClient := mockdb.NewMockBatchEventChannelClient()
 
 	jobID := "job-cancel-1"
@@ -367,7 +366,7 @@ func TestWatchCancel_SetsFlag_CancelsInferContext(t *testing.T) {
 	}
 
 	p := mustNewProcessor(t, config.NewConfig(), &clientset.Clientset{})
-	updater := NewStatusUpdater(dbClient, statusClient, 86400)
+	updater := NewStatusUpdater(dbClient)
 
 	evCh, err := eventClient.ECConsumerGetChannel(ctx, jobID)
 	if err != nil {
@@ -672,10 +671,8 @@ func TestHandleCancelled_CleansDir_UpdatesCancelled(t *testing.T) {
 	cfg.WorkDir = workDir
 
 	dbClient := newMockBatchDBClient()
-	statusClient := mockdb.NewMockBatchStatusClient()
 	clients := &clientset.Clientset{
 		BatchDB: dbClient,
-		Status:  statusClient,
 	}
 	p := mustNewProcessor(t, cfg, clients)
 
@@ -709,7 +706,7 @@ func TestHandleCancelled_CleansDir_UpdatesCancelled(t *testing.T) {
 		t.Fatalf("WriteFile dummy: %v", err)
 	}
 
-	updater := NewStatusUpdater(dbClient, statusClient, 86400)
+	updater := NewStatusUpdater(dbClient)
 
 	if err := p.handleCancelled(ctx, &jobExecutionParams{
 		updater: updater,
@@ -749,7 +746,6 @@ func TestRunPollingLoop_ExpiredJob_UpdatesExpiredStatus(t *testing.T) {
 
 	pq := &spyPQ{inner: mockdb.NewMockBatchPriorityQueueClient()}
 	dbClient := newSpyBatchDB(newMockBatchDBClient())
-	statusClient := mockdb.NewMockBatchStatusClient()
 	jobID := "job-expired-1"
 
 	jobItem := &db.BatchItem{
@@ -782,7 +778,6 @@ func TestRunPollingLoop_ExpiredJob_UpdatesExpiredStatus(t *testing.T) {
 	clients := &clientset.Clientset{
 		BatchDB: dbClient,
 		Queue:   pq,
-		Status:  statusClient,
 	}
 	p := mustNewProcessor(t, cfg, clients)
 
@@ -813,7 +808,6 @@ func TestRunPollingLoop_DBTransient_ReEnqueuesTask(t *testing.T) {
 		inner: innerDB,
 		err:   errors.New("db transient"),
 	}
-	statusClient := mockdb.NewMockBatchStatusClient()
 	jobID := "job-db-transient-1"
 
 	if err := pq.PQEnqueue(ctx, &db.BatchJobPriority{
@@ -827,7 +821,6 @@ func TestRunPollingLoop_DBTransient_ReEnqueuesTask(t *testing.T) {
 	clients := &clientset.Clientset{
 		BatchDB: dbClient,
 		Queue:   pq,
-		Status:  statusClient,
 	}
 	p := mustNewProcessor(t, cfg, clients)
 
@@ -851,7 +844,6 @@ func TestRunPollingLoop_MalformedJobItem_MarksFailed(t *testing.T) {
 
 	pq := &spyPQ{inner: mockdb.NewMockBatchPriorityQueueClient()}
 	dbClient := newSpyBatchDB(newMockBatchDBClient())
-	statusClient := mockdb.NewMockBatchStatusClient()
 	jobID := "job-malformed-1"
 
 	jobItem := &db.BatchItem{
@@ -885,7 +877,6 @@ func TestRunPollingLoop_MalformedJobItem_MarksFailed(t *testing.T) {
 	clients := &clientset.Clientset{
 		BatchDB: dbClient,
 		Queue:   pq,
-		Status:  statusClient,
 	}
 	p := mustNewProcessor(t, cfg, clients)
 
@@ -912,7 +903,6 @@ func TestRunPollingLoop_NotRunnableJob_SkipsWithoutStatusUpdate(t *testing.T) {
 
 	pq := &spyPQ{inner: mockdb.NewMockBatchPriorityQueueClient()}
 	dbClient := newSpyBatchDB(newMockBatchDBClient())
-	statusClient := mockdb.NewMockBatchStatusClient()
 	jobID := "job-not-runnable-1"
 
 	jobItem := &db.BatchItem{
@@ -946,7 +936,6 @@ func TestRunPollingLoop_NotRunnableJob_SkipsWithoutStatusUpdate(t *testing.T) {
 	clients := &clientset.Clientset{
 		BatchDB: dbClient,
 		Queue:   pq,
-		Status:  statusClient,
 	}
 	p := mustNewProcessor(t, cfg, clients)
 
@@ -979,7 +968,6 @@ func TestRunPollingLoop_GuardCancelAfterDequeue_ReEnqueuesBeforeLaunch(t *testin
 		},
 	}
 	dbClient := newSpyBatchDB(newMockBatchDBClient())
-	statusClient := mockdb.NewMockBatchStatusClient()
 	jobID := "job-guard-requeue-1"
 
 	jobItem := &db.BatchItem{
@@ -1011,7 +999,6 @@ func TestRunPollingLoop_GuardCancelAfterDequeue_ReEnqueuesBeforeLaunch(t *testin
 	clients := &clientset.Clientset{
 		BatchDB: dbClient,
 		Queue:   pq,
-		Status:  statusClient,
 	}
 	p := mustNewProcessor(t, cfg, clients)
 
@@ -1042,7 +1029,6 @@ func TestRunPollingLoop_SIGTERMAfterDequeue_ReEnqueuesViaDetachedCtx(t *testing.
 		},
 	}
 	dbClient := newSpyBatchDB(newMockBatchDBClient())
-	statusClient := mockdb.NewMockBatchStatusClient()
 	jobID := "job-sigterm-requeue-1"
 
 	jobItem := &db.BatchItem{
@@ -1074,7 +1060,6 @@ func TestRunPollingLoop_SIGTERMAfterDequeue_ReEnqueuesViaDetachedCtx(t *testing.
 	clients := &clientset.Clientset{
 		BatchDB: dbClient,
 		Queue:   pq,
-		Status:  statusClient,
 	}
 	p := mustNewProcessor(t, cfg, clients)
 
@@ -1112,7 +1097,6 @@ func TestRunPollingLoop_FetchFailsWithCancelledCtx_ReEnqueuesViaDetachedCtx(t *t
 		inner: innerDB,
 		err:   context.Canceled,
 	}
-	statusClient := mockdb.NewMockBatchStatusClient()
 	jobID := "job-fetch-cancel-requeue-1"
 
 	if err := pq.PQEnqueue(ctx, &db.BatchJobPriority{
@@ -1125,7 +1109,6 @@ func TestRunPollingLoop_FetchFailsWithCancelledCtx_ReEnqueuesViaDetachedCtx(t *t
 	clients := &clientset.Clientset{
 		BatchDB: dbClient,
 		Queue:   pq,
-		Status:  statusClient,
 	}
 	p := mustNewProcessor(t, cfg, clients)
 
@@ -1157,10 +1140,9 @@ func TestRunPollingLoop_GuardReEnqueueFails_FallsBackToHandleFailed(t *testing.T
 		afterDequeueFn: func() {
 			pollingCancel()
 		},
-		enqueueErr: fmt.Errorf("redis unavailable"),
+		enqueueErr: fmt.Errorf("queue unavailable"),
 	}
 	dbClient := newSpyBatchDB(newMockBatchDBClient())
-	statusClient := mockdb.NewMockBatchStatusClient()
 	jobID := "job-guard-fail-fallback-1"
 
 	jobItem := &db.BatchItem{
@@ -1192,7 +1174,6 @@ func TestRunPollingLoop_GuardReEnqueueFails_FallsBackToHandleFailed(t *testing.T
 	clients := &clientset.Clientset{
 		BatchDB: dbClient,
 		Queue:   pq,
-		Status:  statusClient,
 	}
 	p := mustNewProcessor(t, cfg, clients)
 
@@ -1833,7 +1814,7 @@ func TestPreProcess_AllRequestsUnregistered_ExecuteJobCounts(t *testing.T) {
 	}
 
 	counts, execErr := p.executeJob(ctx, &jobExecutionParams{
-		updater: NewStatusUpdater(dbClient, mockdb.NewMockBatchStatusClient(), 86400),
+		updater: NewStatusUpdater(dbClient),
 		jobInfo: jobInfo,
 	})
 	if execErr != nil {
@@ -2029,7 +2010,7 @@ func TestPreProcess_ModelNotFound_ThenEarlySLO_PreservesErrorFile(t *testing.T) 
 	defer sloCancel()
 
 	counts, execErr := p.executeJob(sloCtx, &jobExecutionParams{
-		updater: NewStatusUpdater(dbClient, mockdb.NewMockBatchStatusClient(), 86400),
+		updater: NewStatusUpdater(dbClient),
 		jobInfo: jobInfo,
 	})
 	if !errors.Is(execErr, batchctx.ErrExpired) {

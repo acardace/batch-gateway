@@ -49,12 +49,16 @@ func (p *Processor) executeJobAsync(ctx context.Context, params *jobExecutionPar
 	}
 
 	// Setup pipeline.
+	progressInterval := p.cfg.ProgressUpdateInterval
+	if progressInterval <= 0 {
+		progressInterval = 15 * time.Second
+	}
 
 	tracker := pipeline.NewProgressTracker(
 		modelMap.LineCount,
 		params.updater,
 		params.jobInfo.JobID,
-		time.Second,
+		progressInterval,
 		logger,
 	)
 	tracker.AddFailed(modelMap.RejectedCount)

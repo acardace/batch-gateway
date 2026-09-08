@@ -95,7 +95,7 @@ func NewProcessor(
 		return nil, fmt.Errorf("extra endpoints: %w", err)
 	}
 	poller := NewPoller(clients.Queue, clients.BatchDB)
-	updater := NewStatusUpdater(clients.BatchDB, clients.Status, cfg.ProgressTTLSeconds)
+	updater := NewStatusUpdater(clients.BatchDB)
 	return &Processor{
 		cfg:               cfg,
 		endpointAllowlist: endpointAllowlist,
