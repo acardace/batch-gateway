@@ -30,20 +30,6 @@ global:
   dbClient:
     # Database backend type: "postgresql".
     type: "postgresql"
-    # Redis/Valkey client settings.
-    # The connection URL is read from the app secret (redis-url key), not from here.
-    # 0 (or "0s") means go-redis library default.
-    redis:
-      db: 0
-      enableTLS: false
-      insecure: false
-      timeout: "0s"
-      maxRetries: 0
-      minRetryBackoff: "0s"
-      maxRetryBackoff: "0s"
-      poolTimeout: "0s"
-      connMaxIdleTime: "0s"
-      connMaxLifetime: "0s"
 
   # OpenTelemetry configuration
   otel:
@@ -63,9 +49,6 @@ global:
     # Sampling ratio (0.0 to 1.0), used when sampler is "*traceidratio".
     # 1.0 = 100% (dev), 0.1 = 10% (production).
     samplerArg: "1.0"
-    # Enable per-command Redis tracing spans. Can produce high span volume
-    # for batch workloads — leave disabled unless actively debugging Redis.
-    redisTracing: false
     # Enable per-query PostgreSQL tracing spans via otelpgx.
     postgresqlTracing: false
 
