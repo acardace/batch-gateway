@@ -133,7 +133,6 @@ data:
     route_key_method: {{ .Values.processor.config.routeKeyMethod | quote }}
     {{- end }}
     default_output_expiration_seconds: {{ .Values.processor.config.defaultOutputExpirationSeconds }}
-    progress_ttl_seconds: {{ .Values.processor.config.progressTTLSeconds }}
 
     file_client:
       type: {{ .Values.global.fileClient.type | quote }}

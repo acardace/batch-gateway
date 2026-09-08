@@ -420,7 +420,7 @@ processor:
     #       requestQueueName: "llm-d-async:requests:pool-b"
     #       resultQueueName: "llm-d-async:results:pool-b"    # optional: explicit result queue base
     defaultOutputExpirationSeconds: 7776000  # 90 days
-    progressTTLSeconds: 86400  # 24 hours
+    progressUpdateInterval: "15s"  # Throttle interval for DB progress updates
     # Whether to send x-gateway-inference-fairness-id on inference requests.
     # false (default) omits the header entirely.
     sendFairnessHeader: false

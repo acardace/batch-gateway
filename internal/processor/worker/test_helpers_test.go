@@ -294,6 +294,10 @@ func (s *spyBatchDB) DBDelete(ctx context.Context, IDs []string) ([]string, erro
 	return s.inner.DBDelete(ctx, IDs)
 }
 
+func (s *spyBatchDB) DBUpdateProgress(ctx context.Context, id string, counts db.BatchRequestCounts) error {
+	return s.inner.DBUpdateProgress(ctx, id, counts)
+}
+
 func (s *spyBatchDB) GetContext(parentCtx context.Context, timeLimit time.Duration) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(parentCtx, timeLimit)
 }
@@ -334,6 +338,9 @@ func (f *failOnStatusDB) DBUpdate(ctx context.Context, item *db.BatchItem, expec
 func (f *failOnStatusDB) DBDelete(ctx context.Context, IDs []string) ([]string, error) {
 	return f.inner.DBDelete(ctx, IDs)
 }
+func (f *failOnStatusDB) DBUpdateProgress(ctx context.Context, id string, counts db.BatchRequestCounts) error {
+	return f.inner.DBUpdateProgress(ctx, id, counts)
+}
 func (f *failOnStatusDB) GetContext(parentCtx context.Context, timeLimit time.Duration) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(parentCtx, timeLimit)
 }
@@ -371,7 +378,6 @@ func validProcessorClients(t testing.TB) *clientset.Clientset {
 		FileDB:    newMockFileDBClient(),
 		File:      mockfiles.NewMockBatchFilesClient(t.TempDir()),
 		Queue:     mockdb.NewMockBatchPriorityQueueClient(),
-		Status:    mockdb.NewMockBatchStatusClient(),
 		Event:     mockdb.NewMockBatchEventChannelClient(),
 		Inference: inference.NewSingleClientResolver(&fakeInferenceClient{}),
 	}
@@ -392,14 +398,12 @@ func newTestProcessorEnv(t *testing.T, cfg *config.ProcessorConfig, inferClient 
 
 	dbClient := newMockBatchDBClient()
 	pqClient := mockdb.NewMockBatchPriorityQueueClient()
-	statusClient := mockdb.NewMockBatchStatusClient()
 
 	p, err := NewProcessor(cfg, &clientset.Clientset{
 		BatchDB:   dbClient,
 		FileDB:    newMockFileDBClient(),
 		File:      mockfiles.NewMockBatchFilesClient(t.TempDir()),
 		Queue:     pqClient,
-		Status:    statusClient,
 		Event:     mockdb.NewMockBatchEventChannelClient(),
 		Inference: inference.NewSingleClientResolver(inferClient),
 	}, "test-processor", testLogger(t))
@@ -421,7 +425,7 @@ func newTestProcessorEnv(t *testing.T, cfg *config.ProcessorConfig, inferClient 
 		p:        p,
 		dbClient: dbClient,
 		pqClient: pqClient,
-		updater:  NewStatusUpdater(dbClient, statusClient, 86400),
+		updater:  NewStatusUpdater(dbClient),
 	}
 }
 
