@@ -447,10 +447,10 @@ func TestBatchUpdateProgress(t *testing.T) {
 		defer mock.Close()
 
 		mock.ExpectExec("UPDATE "+testTable+" SET status = jsonb_set").
-			WithArgs(`{"total":10,"completed":7,"failed":3}`, "batch-1").
+			WithArgs(`{"total":10,"completed":7,"failed":3}`, "batch-1", int64(5)).
 			WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 
-		err := client.DBUpdateProgress(ctx, "batch-1", api.BatchRequestCounts{
+		err := client.DBUpdateProgress(ctx, "batch-1", 5, api.BatchRequestCounts{
 			Total:     10,
 			Completed: 7,
 			Failed:    3,
@@ -463,11 +463,47 @@ func TestBatchUpdateProgress(t *testing.T) {
 		}
 	})
 
+	t.Run("SQL carries the epoch fence", func(t *testing.T) {
+		client, mock := newTestBatchClient(t)
+		defer mock.Close()
+
+		mock.ExpectExec("UPDATE "+testTable+".*epoch = \\$3").
+			WithArgs(pgxmock.AnyArg(), "batch-1", int64(7)).
+			WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+
+		err := client.DBUpdateProgress(ctx, "batch-1", 7, api.BatchRequestCounts{Total: 1})
+		if err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatalf("unmet expectations: %v", err)
+		}
+	})
+
+	t.Run("stale epoch write is a silent no-op", func(t *testing.T) {
+		client, mock := newTestBatchClient(t)
+		defer mock.Close()
+
+		// Fence mismatch: the UPDATE matches no rows and must not surface
+		// an error (the fenced-out writer's progress is simply discarded).
+		mock.ExpectExec("UPDATE "+testTable+".*epoch = \\$3").
+			WithArgs(pgxmock.AnyArg(), "batch-1", int64(4)).
+			WillReturnResult(pgxmock.NewResult("UPDATE", 0))
+
+		err := client.DBUpdateProgress(ctx, "batch-1", 4, api.BatchRequestCounts{Total: 1})
+		if err != nil {
+			t.Fatalf("stale-epoch write must be silently discarded, got %v", err)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatalf("unmet expectations: %v", err)
+		}
+	})
+
 	t.Run("returns error for empty ID", func(t *testing.T) {
 		client, mock := newTestBatchClient(t)
 		defer mock.Close()
 
-		err := client.DBUpdateProgress(ctx, "", api.BatchRequestCounts{Total: 1})
+		err := client.DBUpdateProgress(ctx, "", 1, api.BatchRequestCounts{Total: 1})
 		if err == nil {
 			t.Fatal("expected error for empty ID")
 		}

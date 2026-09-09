@@ -173,7 +173,7 @@ func (m *MockDBClient[T, Q]) DBDelete(ctx context.Context, ids []string) (delete
 	return
 }
 
-func (m *MockDBClient[T, Q]) DBUpdateProgress(ctx context.Context, id string, counts api.BatchRequestCounts) error {
+func (m *MockDBClient[T, Q]) DBUpdateProgress(ctx context.Context, id string, epoch int64, counts api.BatchRequestCounts) error {
 	if id == "" {
 		return fmt.Errorf("DBUpdateProgress: empty ID")
 	}
@@ -184,6 +184,12 @@ func (m *MockDBClient[T, Q]) DBUpdateProgress(ctx context.Context, id string, co
 
 	if existingItem, ok := existing.(*T); ok {
 		val := reflect.ValueOf(existingItem).Elem()
+		// Mirror the Postgres epoch fence: items with an Epoch field are only
+		// updated when the caller carries the current epoch; a stale-epoch
+		// write matches no rows and is silently discarded.
+		if epochField := val.FieldByName("Epoch"); epochField.IsValid() && epochField.Kind() == reflect.Int64 && epochField.Int() != epoch {
+			return nil
+		}
 		statusField := val.FieldByName("Status")
 		if statusField.IsValid() && statusField.CanSet() && statusField.Kind() == reflect.Slice {
 			currentStatus, _ := statusField.Interface().([]byte)

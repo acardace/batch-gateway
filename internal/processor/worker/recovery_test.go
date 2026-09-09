@@ -336,7 +336,7 @@ func (f *failOnGetDB) DBGet(_ context.Context, _ *db.BatchQuery, _ bool, _, _ in
 	return nil, 0, false, f.err
 }
 func (f *failOnGetDB) DBUpdate(_ context.Context, _ *db.BatchItem, _ []byte) error { return nil }
-func (f *failOnGetDB) DBUpdateProgress(_ context.Context, _ string, _ db.BatchRequestCounts) error {
+func (f *failOnGetDB) DBUpdateProgress(_ context.Context, _ string, _ int64, _ db.BatchRequestCounts) error {
 	return nil
 }
 func (f *failOnGetDB) DBDelete(_ context.Context, _ []string) ([]string, error) { return nil, nil }
