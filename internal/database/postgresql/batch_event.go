@@ -33,6 +33,10 @@ import (
 const (
 	eventChanBufSize = 100
 	channelEvents    = "batch_events"
+
+	// eventSweepInterval is how often expired, never-consumed events are
+	// purged from batch_events.
+	eventSweepInterval = 30 * time.Second
 )
 
 var errEventChannelFull = errors.New("event channel full")
@@ -53,6 +57,13 @@ WHERE id IN (
 )
 RETURNING event_type`
 
+// ecPurgeExpiredEventsSQL deletes events that are past their TTL and were
+// never consumed. The drain above only removes unexpired rows, so without
+// this sweep the table would grow without bound. Uses
+// idx_batch_events_expires_at.
+const ecPurgeExpiredEventsSQL = `DELETE FROM batch_events
+WHERE expires_at < EXTRACT(EPOCH FROM NOW())::BIGINT`
+
 type eventSub struct {
 	ch        chan api.BatchEvent
 	closeOnce sync.Once
@@ -71,6 +82,9 @@ type PostgresBatchEventClient struct {
 	eventSubs    map[string]*eventSub
 	eventsCancel context.CancelFunc
 	eventsDone   chan struct{}
+
+	sweepCancel context.CancelFunc
+	sweepDone   chan struct{}
 }
 
 var _ api.BatchEventChannelClient = (*PostgresBatchEventClient)(nil)
@@ -101,6 +115,7 @@ func NewPostgresBatchEventClient(ctx context.Context, config *PostgreSQLConfig, 
 
 	c.listener = newPGListener(pool, channelEvents, logger, c.onReconnect)
 	c.startEventDispatcher()
+	c.startEventSweeper()
 
 	logger.V(logging.INFO).Info("NewPostgresBatchEventClient: client created successfully")
 	return c, nil
@@ -112,6 +127,10 @@ func (c *PostgresBatchEventClient) Close() error {
 			c.eventsCancel()
 			<-c.eventsDone
 		}
+		if c.sweepCancel != nil {
+			c.sweepCancel()
+			<-c.sweepDone
+		}
 		if c.listener != nil {
 			_ = c.listener.close()
 		}
@@ -120,6 +139,45 @@ func (c *PostgresBatchEventClient) Close() error {
 		}
 	})
 	return nil
+}
+
+// startEventSweeper periodically purges expired, never-consumed events so the
+// table cannot grow without bound (the drain only removes unexpired rows).
+func (c *PostgresBatchEventClient) startEventSweeper() {
+	sweepCtx, cancel := context.WithCancel(context.Background())
+	c.sweepCancel = cancel
+	c.sweepDone = make(chan struct{})
+
+	go func() {
+		defer close(c.sweepDone)
+		ticker := time.NewTicker(eventSweepInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-sweepCtx.Done():
+				return
+			case <-ticker.C:
+				purged, err := c.purgeExpiredEvents(sweepCtx)
+				if err != nil {
+					c.logger.V(logging.INFO).Info("event sweeper: purge failed", "err", err.Error())
+					continue
+				}
+				if purged > 0 {
+					c.logger.V(logging.INFO).Info("event sweeper: purged expired events", "purged", purged)
+				}
+			}
+		}
+	}()
+}
+
+// purgeExpiredEvents deletes expired, never-consumed events and returns the
+// number of rows removed.
+func (c *PostgresBatchEventClient) purgeExpiredEvents(ctx context.Context) (int64, error) {
+	result, err := c.pool.Exec(ctx, ecPurgeExpiredEventsSQL)
+	if err != nil {
+		return 0, fmt.Errorf("purge expired events: %w", err)
+	}
+	return result.RowsAffected(), nil
 }
 
 func (c *PostgresBatchEventClient) ECProducerSendEvents(ctx context.Context, events []api.BatchEvent) (sentIDs []string, err error) {
