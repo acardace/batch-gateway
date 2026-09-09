@@ -294,8 +294,8 @@ func (s *spyBatchDB) DBDelete(ctx context.Context, IDs []string) ([]string, erro
 	return s.inner.DBDelete(ctx, IDs)
 }
 
-func (s *spyBatchDB) DBUpdateProgress(ctx context.Context, id string, counts db.BatchRequestCounts) error {
-	return s.inner.DBUpdateProgress(ctx, id, counts)
+func (s *spyBatchDB) DBUpdateProgress(ctx context.Context, id string, epoch int64, counts db.BatchRequestCounts) error {
+	return s.inner.DBUpdateProgress(ctx, id, epoch, counts)
 }
 
 func (s *spyBatchDB) GetContext(parentCtx context.Context, timeLimit time.Duration) (context.Context, context.CancelFunc) {
@@ -338,8 +338,8 @@ func (f *failOnStatusDB) DBUpdate(ctx context.Context, item *db.BatchItem, expec
 func (f *failOnStatusDB) DBDelete(ctx context.Context, IDs []string) ([]string, error) {
 	return f.inner.DBDelete(ctx, IDs)
 }
-func (f *failOnStatusDB) DBUpdateProgress(ctx context.Context, id string, counts db.BatchRequestCounts) error {
-	return f.inner.DBUpdateProgress(ctx, id, counts)
+func (f *failOnStatusDB) DBUpdateProgress(ctx context.Context, id string, epoch int64, counts db.BatchRequestCounts) error {
+	return f.inner.DBUpdateProgress(ctx, id, epoch, counts)
 }
 func (f *failOnStatusDB) GetContext(parentCtx context.Context, timeLimit time.Duration) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(parentCtx, timeLimit)

@@ -48,17 +48,20 @@ func (s *StatusUpdater) validate() error {
 	return nil
 }
 
-// UpdateProgressCounts updates the in-flight request counts directly in the database.
+// UpdateProgressCounts updates the in-flight request counts directly in the
+// database, fenced by the job's epoch so a fenced-out processor incarnation
+// cannot overwrite the current owner's counts.
 func (s *StatusUpdater) UpdateProgressCounts(
 	ctx context.Context,
 	jobID string,
+	epoch int64,
 	requestCounts *openai.BatchRequestCounts,
 ) error {
 	if requestCounts == nil {
 		return fmt.Errorf("requestCounts is nil")
 	}
 
-	return s.db.DBUpdateProgress(ctx, jobID, db.BatchRequestCounts{
+	return s.db.DBUpdateProgress(ctx, jobID, epoch, db.BatchRequestCounts{
 		Total:     requestCounts.Total,
 		Completed: requestCounts.Completed,
 		Failed:    requestCounts.Failed,
