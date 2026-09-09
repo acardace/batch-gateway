@@ -103,10 +103,11 @@ func (c *PostgresFileDBClient) DBGet(
 
 	items = make([]*api.FileItem, len(indexes))
 	for i := range indexes {
+		purpose, _ := extras[i][colPurpose].(string)
 		items[i] = &api.FileItem{
 			BaseIndexes:  *indexes[i],
 			BaseContents: *contents[i],
-			Purpose:      extras[i][colPurpose].(string),
+			Purpose:      purpose,
 		}
 	}
 
