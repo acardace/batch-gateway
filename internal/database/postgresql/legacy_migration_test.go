@@ -59,12 +59,12 @@ func TestLegacyRowsAfterMigration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPostgresBatchDBClient (migration): %v", err)
 	}
-	defer batchDB.Close()
+	t.Cleanup(func() { _ = batchDB.Close() })
 	queue, err := NewPostgresBatchQueueClient(ctx, cfg, "processor-0")
 	if err != nil {
 		t.Fatalf("NewPostgresBatchQueueClient: %v", err)
 	}
-	defer queue.Close()
+	t.Cleanup(func() { _ = queue.Close() })
 
 	t.Run("queued legacy row is dequeued with its SLO", func(t *testing.T) {
 		jobs, err := queue.PQDequeue(ctx, 0, 10)
