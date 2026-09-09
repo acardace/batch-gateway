@@ -62,6 +62,7 @@ type Reconciler struct {
 
 	mu             sync.RWMutex
 	liveProcessors map[string]bool
+	snapshotReady  bool
 
 	triggerCh chan struct{}
 }
@@ -100,6 +101,13 @@ func (r *Reconciler) SetLiveProcessors(processors map[string]bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.liveProcessors = processors
+	r.snapshotReady = true
+}
+
+func (r *Reconciler) hasSnapshot() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.snapshotReady
 }
 
 // Trigger requests an immediate reconciliation cycle. Non-blocking.
@@ -155,6 +163,11 @@ func (r *Reconciler) run(ctx context.Context) {
 		)
 		r.notifyCycle(result)
 	}()
+
+	if !r.hasSnapshot() {
+		logger.Info("Reconciler: no live processor snapshot yet, skipping cycle")
+		return
+	}
 
 	jobs, err := r.fetchNonTerminalJobs(ctx)
 	if err != nil {
