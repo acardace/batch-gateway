@@ -51,7 +51,7 @@ import (
 var panicRecoveryTimeout = time.Minute
 
 func (p *Processor) runJob(ctx context.Context, params *jobExecutionParams) {
-	// Restore parent trace context propagated from the apiserver via Redis tags
+	// Restore parent trace context propagated from the apiserver via batch tags
 	if len(params.jobInfo.TraceContext) > 0 {
 		propagator := otel.GetTextMapPropagator()
 		ctx = propagator.Extract(ctx, propagation.MapCarrier(params.jobInfo.TraceContext))
