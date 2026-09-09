@@ -24,7 +24,6 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
-	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/llm-d/llm-d-batch-gateway/internal/database/api"
 	"github.com/llm-d/llm-d-batch-gateway/internal/util/logging"
@@ -37,6 +36,10 @@ const (
 	// eventSweepInterval is how often expired, never-consumed events are
 	// purged from batch_events.
 	eventSweepInterval = 30 * time.Second
+
+	// eventRescanInterval is how often the dispatcher re-drains every
+	// subscribed job as a delivery backstop (see runEventDispatcher).
+	eventRescanInterval = 30 * time.Second
 )
 
 var errEventChannelFull = errors.New("event channel full")
@@ -73,7 +76,7 @@ type eventSub struct {
 // The batch_events table is the durable source of truth (late-attach safe);
 // PostgreSQL LISTEN/NOTIFY provides low-latency notification delivery without polling.
 type PostgresBatchEventClient struct {
-	pool      *pgxpool.Pool
+	pool      pgxPool
 	listener  *pgListener
 	logger    logr.Logger
 	closeOnce sync.Once
@@ -82,6 +85,9 @@ type PostgresBatchEventClient struct {
 	eventSubs    map[string]*eventSub
 	eventsCancel context.CancelFunc
 	eventsDone   chan struct{}
+
+	rescanInterval time.Duration
+	rescanNow      chan struct{}
 
 	sweepCancel context.CancelFunc
 	sweepDone   chan struct{}
@@ -108,9 +114,11 @@ func NewPostgresBatchEventClient(ctx context.Context, config *PostgreSQLConfig, 
 	}
 
 	c := &PostgresBatchEventClient{
-		pool:      pool,
-		logger:    logger,
-		eventSubs: make(map[string]*eventSub),
+		pool:           pool,
+		logger:         logger,
+		eventSubs:      make(map[string]*eventSub),
+		rescanInterval: eventRescanInterval,
+		rescanNow:      make(chan struct{}, 1),
 	}
 
 	c.listener = newPGListener(pool, channelEvents, logger, c.onReconnect)
@@ -220,6 +228,12 @@ func (c *PostgresBatchEventClient) ECConsumerGetChannel(ctx context.Context, ID 
 	}
 
 	c.eventsMu.Lock()
+	if _, exists := c.eventSubs[ID]; exists {
+		// Replace the previous subscriber. Its CloseFn is identity-guarded, so
+		// it will close its own channel when its consumer exits; events drain
+		// to the newest subscriber from here on.
+		c.logger.V(logging.INFO).Info("event channel: replacing existing subscriber", "ID", ID)
+	}
 	c.eventSubs[ID] = sub
 	c.eventsMu.Unlock()
 
@@ -240,10 +254,15 @@ func (c *PostgresBatchEventClient) ECConsumerGetChannel(ctx context.Context, ID 
 }
 
 func (c *PostgresBatchEventClient) onReconnect() {
-	c.eventsMu.Lock()
-	defer c.eventsMu.Unlock()
-	// Trigger deliverAllJobEvents asynchronously so listen loop is never blocked
-	go c.deliverAllJobEvents(context.Background())
+	// Nudge the dispatcher to drain subscribed jobs promptly (events may have
+	// been missed while the listener was down). The listen loop only does a
+	// non-blocking send; the drain runs in the dispatcher. A full nudge channel
+	// means a drain is already queued or running — the periodic backstop tick
+	// covers the rest.
+	select {
+	case c.rescanNow <- struct{}{}:
+	default:
+	}
 }
 
 func (c *PostgresBatchEventClient) startEventDispatcher() {
@@ -258,7 +277,14 @@ func (c *PostgresBatchEventClient) startEventDispatcher() {
 func (c *PostgresBatchEventClient) runEventDispatcher(ctx context.Context, wake <-chan string, unsubscribe func()) {
 	defer close(c.eventsDone)
 	defer unsubscribe()
-	c.logger.V(logging.INFO).Info("event dispatcher: start")
+
+	// NOTIFY is a latency hint, not a delivery guarantee: a notification
+	// dropped on a full wake channel (or missed across a listener flap)
+	// must not lose the event. The row stays in batch_events, so periodically
+	// re-drain every subscribed job to make delivery eventually correct.
+	ticker := time.NewTicker(c.rescanInterval)
+	defer ticker.Stop()
+	c.logger.V(logging.INFO).Info("event dispatcher: start", "rescanInterval", c.rescanInterval.String())
 
 	for {
 		select {
@@ -274,6 +300,10 @@ func (c *PostgresBatchEventClient) runEventDispatcher(ctx context.Context, wake 
 			} else {
 				c.deliverJobEvents(ctx, payload)
 			}
+		case <-ticker.C:
+			c.deliverAllJobEvents(ctx)
+		case <-c.rescanNow:
+			c.deliverAllJobEvents(ctx)
 		}
 	}
 }
@@ -311,6 +341,9 @@ func (c *PostgresBatchEventClient) deliverJobEvents(ctx context.Context, jobID s
 	c.eventsMu.Lock()
 	defer c.eventsMu.Unlock()
 	if cur, present := c.eventSubs[jobID]; !present || cur != sub {
+		// The subscriber closed between the drain and the delivery check. The
+		// rows are already deleted; log so the discard is visible.
+		c.logger.V(logging.INFO).Info("event dispatcher: subscriber gone before delivery, discarding drained events", "ID", jobID, "n", len(events))
 		return
 	}
 	for _, event := range events {
