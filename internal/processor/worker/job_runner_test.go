@@ -406,8 +406,8 @@ func (d *dbBlockingUpdateWrapper) DBUpdate(ctx context.Context, _ *db.BatchItem,
 	<-ctx.Done()
 	return ctx.Err()
 }
-func (d *dbBlockingUpdateWrapper) DBUpdateProgress(ctx context.Context, id string, counts db.BatchRequestCounts) error {
-	return d.inner.DBUpdateProgress(ctx, id, counts)
+func (d *dbBlockingUpdateWrapper) DBUpdateProgress(ctx context.Context, id string, epoch int64, counts db.BatchRequestCounts) error {
+	return d.inner.DBUpdateProgress(ctx, id, epoch, counts)
 }
 func (d *dbBlockingUpdateWrapper) DBDelete(ctx context.Context, IDs []string) ([]string, error) {
 	return d.inner.DBDelete(ctx, IDs)

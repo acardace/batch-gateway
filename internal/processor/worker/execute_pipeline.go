@@ -17,6 +17,24 @@ import (
 	"github.com/llm-d/llm-d-batch-gateway/internal/util/logging"
 )
 
+// epochProgressUpdater fences progress writes by an explicit epoch.
+// *StatusUpdater satisfies it.
+type epochProgressUpdater interface {
+	UpdateProgressCounts(ctx context.Context, jobID string, epoch int64, counts *openai.BatchRequestCounts) error
+}
+
+// jobProgressUpdater scopes a shared updater to one job's epoch so every
+// progress write for that job is fenced by its ownership epoch.
+type jobProgressUpdater struct {
+	inner epochProgressUpdater
+	jobID string
+	epoch int64
+}
+
+func (u jobProgressUpdater) UpdateProgressCounts(ctx context.Context, jobID string, counts *openai.BatchRequestCounts) error {
+	return u.inner.UpdateProgressCounts(ctx, u.jobID, u.epoch, counts)
+}
+
 func (p *Processor) executeJobAsync(ctx context.Context, params *jobExecutionParams) (*openai.BatchRequestCounts, error) {
 	logger := logr.FromContextOrDiscard(ctx)
 	logger.V(logging.INFO).Info("Starting execution (v2 pipeline)")
@@ -54,9 +72,16 @@ func (p *Processor) executeJobAsync(ctx context.Context, params *jobExecutionPar
 		progressInterval = 15 * time.Second
 	}
 
+	// jobItem is always set on the production path (the polling loop skips
+	// jobs with no DB item); the guard only covers test constructions.
+	jobEpoch := int64(0)
+	if params.jobItem != nil {
+		jobEpoch = params.jobItem.Epoch
+	}
+
 	tracker := pipeline.NewProgressTracker(
 		modelMap.LineCount,
-		params.updater,
+		jobProgressUpdater{inner: params.updater, jobID: params.jobInfo.JobID, epoch: jobEpoch},
 		params.jobInfo.JobID,
 		progressInterval,
 		logger,

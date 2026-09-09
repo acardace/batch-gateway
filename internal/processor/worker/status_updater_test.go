@@ -17,7 +17,7 @@ type dbProgressErrWrapper struct {
 	err error
 }
 
-func (d *dbProgressErrWrapper) DBUpdateProgress(ctx context.Context, id string, counts db.BatchRequestCounts) error {
+func (d *dbProgressErrWrapper) DBUpdateProgress(ctx context.Context, id string, epoch int64, counts db.BatchRequestCounts) error {
 	return d.err
 }
 
@@ -35,8 +35,8 @@ func (d *dbUpdateErrWrapper) DBGet(ctx context.Context, query *db.BatchQuery, in
 func (d *dbUpdateErrWrapper) DBUpdate(ctx context.Context, item *db.BatchItem, expectedStatus []byte) error {
 	return d.err
 }
-func (d *dbUpdateErrWrapper) DBUpdateProgress(ctx context.Context, id string, counts db.BatchRequestCounts) error {
-	return d.inner.DBUpdateProgress(ctx, id, counts)
+func (d *dbUpdateErrWrapper) DBUpdateProgress(ctx context.Context, id string, epoch int64, counts db.BatchRequestCounts) error {
+	return d.inner.DBUpdateProgress(ctx, id, epoch, counts)
 }
 func (d *dbUpdateErrWrapper) DBDelete(ctx context.Context, IDs []string) ([]string, error) {
 	return d.inner.DBDelete(ctx, IDs)
@@ -68,8 +68,8 @@ func (d *dbUpdateFailOnceWrapper) DBUpdate(ctx context.Context, item *db.BatchIt
 	}
 	return d.inner.DBUpdate(ctx, item, expectedStatus)
 }
-func (d *dbUpdateFailOnceWrapper) DBUpdateProgress(ctx context.Context, id string, counts db.BatchRequestCounts) error {
-	return d.inner.DBUpdateProgress(ctx, id, counts)
+func (d *dbUpdateFailOnceWrapper) DBUpdateProgress(ctx context.Context, id string, epoch int64, counts db.BatchRequestCounts) error {
+	return d.inner.DBUpdateProgress(ctx, id, epoch, counts)
 }
 func (d *dbUpdateFailOnceWrapper) DBDelete(ctx context.Context, IDs []string) ([]string, error) {
 	return d.inner.DBDelete(ctx, IDs)
@@ -84,7 +84,7 @@ func (d *dbUpdateFailOnceWrapper) Close() error {
 func TestUpdateProgressCounts_NilCounts_ReturnsError(t *testing.T) {
 	updater := NewStatusUpdater(newMockBatchDBClient())
 
-	if err := updater.UpdateProgressCounts(context.Background(), "job-1", nil); err == nil {
+	if err := updater.UpdateProgressCounts(context.Background(), "job-1", 0, nil); err == nil {
 		t.Fatalf("expected error for nil requestCounts")
 	}
 }
@@ -93,7 +93,7 @@ func TestUpdateProgressCounts_StatusSetError_ReturnsError(t *testing.T) {
 	statusErr := errors.New("progress update failed")
 	updater := NewStatusUpdater(&dbProgressErrWrapper{BatchDBClient: newMockBatchDBClient(), err: statusErr})
 
-	err := updater.UpdateProgressCounts(context.Background(), "job-1", &openai.BatchRequestCounts{Total: 1})
+	err := updater.UpdateProgressCounts(context.Background(), "job-1", 0, &openai.BatchRequestCounts{Total: 1})
 	if !errors.Is(err, statusErr) {
 		t.Fatalf("expected progress error, got %v", err)
 	}
@@ -114,7 +114,7 @@ func TestUpdateProgressCounts_Success_WritesPayload(t *testing.T) {
 		t.Fatalf("DBStore seed: %v", err)
 	}
 
-	if err := updater.UpdateProgressCounts(ctx, "job-1", &openai.BatchRequestCounts{
+	if err := updater.UpdateProgressCounts(ctx, "job-1", 0, &openai.BatchRequestCounts{
 		Total: 10, Completed: 7, Failed: 3,
 	}); err != nil {
 		t.Fatalf("UpdateProgressCounts: %v", err)

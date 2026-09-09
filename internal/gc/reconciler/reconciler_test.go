@@ -143,7 +143,7 @@ func (c *casConflictBatchDB) DBUpdate(_ context.Context, _ *db.BatchItem, _ []by
 func (c *casConflictBatchDB) DBDelete(_ context.Context, _ []string) ([]string, error) {
 	return nil, nil
 }
-func (c *casConflictBatchDB) DBUpdateProgress(_ context.Context, _ string, _ db.BatchRequestCounts) error {
+func (c *casConflictBatchDB) DBUpdateProgress(_ context.Context, _ string, _ int64, _ db.BatchRequestCounts) error {
 	return nil
 }
 func (c *casConflictBatchDB) Close() error { return nil }
@@ -568,7 +568,7 @@ func (f *failGetBatchDB) DBGet(_ context.Context, _ *db.BatchQuery, _ bool, _, _
 }
 func (f *failGetBatchDB) DBUpdate(_ context.Context, _ *db.BatchItem, _ []byte) error { return nil }
 func (f *failGetBatchDB) DBDelete(_ context.Context, _ []string) ([]string, error)    { return nil, nil }
-func (f *failGetBatchDB) DBUpdateProgress(_ context.Context, _ string, _ db.BatchRequestCounts) error {
+func (f *failGetBatchDB) DBUpdateProgress(_ context.Context, _ string, _ int64, _ db.BatchRequestCounts) error {
 	return nil
 }
 func (f *failGetBatchDB) Close() error { return nil }
