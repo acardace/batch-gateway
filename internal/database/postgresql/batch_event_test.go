@@ -241,3 +241,84 @@ func TestPostgresBatchEventClient_PurgeExpiredEvents(t *testing.T) {
 		t.Fatalf("expected %s to remain, got %s", liveJob, remainingJob)
 	}
 }
+
+// newTestEventClientForURL requires a real PostgreSQL instance
+// (TEST_POSTGRES_URL) and returns an event client wired to it.
+func newTestEventClientForURL(t *testing.T, url string) *PostgresBatchEventClient {
+	t.Helper()
+	client, err := NewPostgresBatchEventClient(context.Background(), &PostgreSQLConfig{Url: url}, logr.Discard())
+	if err != nil {
+		t.Fatalf("NewPostgresBatchEventClient: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	return client
+}
+
+// TestPostgresBatchEventClient_RoundTrip requires a real PostgreSQL instance
+// (TEST_POSTGRES_URL) and verifies the full path: a produced event is drained
+// from the table and delivered to a live subscriber. The 35s window covers the
+// NOTIFY fast path (sub-second) and the 30s backstop rescan.
+func TestPostgresBatchEventClient_RoundTrip(t *testing.T) {
+	url := os.Getenv("TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("TEST_POSTGRES_URL not set")
+	}
+	const jobID = "round-trip-job"
+	client := newTestEventClientForURL(t, url)
+
+	ch, err := client.ECConsumerGetChannel(context.Background(), jobID)
+	if err != nil {
+		t.Fatalf("ECConsumerGetChannel: %v", err)
+	}
+	defer ch.CloseFn()
+
+	if _, err := client.ECProducerSendEvents(context.Background(), []api.BatchEvent{
+		{ID: jobID, Type: api.BatchEventCancel, TTL: 300},
+	}); err != nil {
+		t.Fatalf("ECProducerSendEvents: %v", err)
+	}
+
+	select {
+	case ev := <-ch.Events:
+		if ev.ID != jobID || ev.Type != api.BatchEventCancel {
+			t.Fatalf("unexpected event: %+v", ev)
+		}
+	case <-time.After(35 * time.Second):
+		t.Fatal("event not delivered within 35s (NOTIFY path or backstop rescan)")
+	}
+}
+
+// TestPostgresBatchEventClient_LateAttach requires a real PostgreSQL instance
+// (TEST_POSTGRES_URL) and verifies the durability contract: an event produced
+// before any subscriber exists is still delivered when a subscriber attaches
+// later (the proactive drain picks the row up from the table).
+func TestPostgresBatchEventClient_LateAttach(t *testing.T) {
+	url := os.Getenv("TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("TEST_POSTGRES_URL not set")
+	}
+	const jobID = "late-attach-job"
+	client := newTestEventClientForURL(t, url)
+
+	// Produce with no subscriber: the row must remain in the table.
+	if _, err := client.ECProducerSendEvents(context.Background(), []api.BatchEvent{
+		{ID: jobID, Type: api.BatchEventCancel, TTL: 300},
+	}); err != nil {
+		t.Fatalf("ECProducerSendEvents: %v", err)
+	}
+
+	ch, err := client.ECConsumerGetChannel(context.Background(), jobID)
+	if err != nil {
+		t.Fatalf("ECConsumerGetChannel: %v", err)
+	}
+	defer ch.CloseFn()
+
+	select {
+	case ev := <-ch.Events:
+		if ev.ID != jobID || ev.Type != api.BatchEventCancel {
+			t.Fatalf("unexpected event: %+v", ev)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("late-attach drain did not deliver the pre-existing event within 5s")
+	}
+}
