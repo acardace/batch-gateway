@@ -13,7 +13,7 @@ import (
 )
 
 type dbProgressErrWrapper struct {
-	db.BatchDBClient
+	db.BatchProgressDBClient
 	err error
 }
 
@@ -22,7 +22,7 @@ func (d *dbProgressErrWrapper) DBUpdateProgress(ctx context.Context, id string, 
 }
 
 type dbUpdateErrWrapper struct {
-	inner db.BatchDBClient
+	inner db.BatchProgressDBClient
 	err   error
 }
 
@@ -50,7 +50,7 @@ func (d *dbUpdateErrWrapper) Close() error {
 
 // dbUpdateFailOnceWrapper fails the first N DBUpdate calls, then delegates to inner.
 type dbUpdateFailOnceWrapper struct {
-	inner     db.BatchDBClient
+	inner     db.BatchProgressDBClient
 	failCount int
 	calls     int
 }
@@ -91,7 +91,7 @@ func TestUpdateProgressCounts_NilCounts_ReturnsError(t *testing.T) {
 
 func TestUpdateProgressCounts_StatusSetError_ReturnsError(t *testing.T) {
 	statusErr := errors.New("progress update failed")
-	updater := NewStatusUpdater(&dbProgressErrWrapper{BatchDBClient: newMockBatchDBClient(), err: statusErr})
+	updater := NewStatusUpdater(&dbProgressErrWrapper{BatchProgressDBClient: newMockBatchDBClient(), err: statusErr})
 
 	err := updater.UpdateProgressCounts(context.Background(), "job-1", 0, &openai.BatchRequestCounts{Total: 1})
 	if !errors.Is(err, statusErr) {
