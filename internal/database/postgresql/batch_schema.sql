@@ -30,6 +30,17 @@ ALTER TABLE batch_items ADD COLUMN IF NOT EXISTS priority BIGINT;
 ALTER TABLE batch_items ADD COLUMN IF NOT EXISTS epoch BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE batch_items ADD COLUMN IF NOT EXISTS recovery_attempts BIGINT NOT NULL DEFAULT 0;
 
+-- Rows written before the queue columns existed carry the SLO in a tag and
+-- have no owner. Restore the queue order from the tag and hand in-flight rows
+-- to a sentinel owner so the reconciler reclaims them on its first cycle.
+UPDATE batch_items
+   SET priority = (tags->>'slo_unix_micro')::bigint
+ WHERE priority IS NULL AND tags ? 'slo_unix_micro';
+UPDATE batch_items
+   SET processor_id = 'pre-migration'
+ WHERE processor_id IS NULL
+   AND status::jsonb->>'status' IN ('in_progress', 'finalizing', 'cancelling');
+
 CREATE INDEX IF NOT EXISTS idx_batch_items_tenant_id ON batch_items(tenant_id);
 CREATE INDEX IF NOT EXISTS idx_batch_items_expiry ON batch_items(expiry) WHERE expiry IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_batch_items_tags ON batch_items USING GIN (tags) WHERE tags IS NOT NULL;
