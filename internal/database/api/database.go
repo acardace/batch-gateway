@@ -109,6 +109,8 @@ type BatchJobPriority struct {
 	Data  []byte    `json:"data,omitempty"`  // [optional] User defined data.
 	TTL   int       `json:"ttl,omitempty"`   // [optional] TTL in seconds applied on the entire queue. If used, this should be set to a sufficiently large value to prevent premature removal of items.
 	Epoch int64     `json:"epoch,omitempty"` // Fencing token incremented on every ownership change.
+	// RecoveryAttempts counts startup recoveries of the current ownership.
+	RecoveryAttempts int64 `json:"recovery_attempts,omitempty"`
 }
 
 func (bj *BatchJobPriority) IsValid() error {
@@ -124,6 +126,11 @@ func (bj *BatchJobPriority) IsValid() error {
 // BatchPriorityQueueClient enables to perform operations on a priority queue of jobs.
 type BatchPriorityQueueClient interface {
 	store.BatchClientAdmin
+
+	// PQClaimOwned takes ownership of every non-terminal job already assigned to
+	// this processor for startup recovery: bumps the fencing epoch and the
+	// recovery attempt counter and returns the claimed jobs with the new values.
+	PQClaimOwned(ctx context.Context) ([]*BatchJobPriority, error)
 
 	// PQEnqueue adds a job priority object to the queue.
 	PQEnqueue(ctx context.Context, jobPriority *BatchJobPriority) (err error)

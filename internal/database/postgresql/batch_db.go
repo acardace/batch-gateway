@@ -45,9 +45,10 @@ func buildNonTerminalCondition() string {
 }
 
 const (
-	colProcessorID = "processor_id"
-	colPriority    = "priority"
-	colEpoch       = "epoch"
+	colProcessorID      = "processor_id"
+	colPriority         = "priority"
+	colEpoch            = "epoch"
+	colRecoveryAttempts = "recovery_attempts"
 )
 
 // Compile-time check: batchDescriptor implements TableDescriptor.
@@ -59,7 +60,7 @@ type batchDescriptor struct{}
 func (batchDescriptor) TableName() string { return "batch_items" }
 func (batchDescriptor) Schema() string    { return batchSchemaSql }
 func (batchDescriptor) ExtraColumns() []string {
-	return []string{colProcessorID, colPriority, colEpoch}
+	return []string{colProcessorID, colPriority, colEpoch, colRecoveryAttempts}
 }
 
 // PostgresBatchDBClient implements api.BatchDBClient using PostgreSQL.
@@ -98,9 +99,10 @@ func (c *PostgresBatchDBClient) DBStore(ctx context.Context, item *api.BatchItem
 		processorID = nil
 	}
 	if err = c.store(ctx, &item.BaseIndexes, &item.BaseContents, map[string]any{
-		colProcessorID: processorID,
-		colPriority:    item.Priority,
-		colEpoch:       item.Epoch,
+		colProcessorID:      processorID,
+		colPriority:         item.Priority,
+		colEpoch:            item.Epoch,
+		colRecoveryAttempts: item.RecoveryAttempts,
 	}); err != nil {
 		return
 	}
@@ -139,12 +141,14 @@ func (c *PostgresBatchDBClient) DBGet(
 		processorID, _ := extras[i][colProcessorID].(string)
 		priority, _ := extras[i][colPriority].(int64)
 		epoch, _ := extras[i][colEpoch].(int64)
+		recoveryAttempts, _ := extras[i][colRecoveryAttempts].(int64)
 		items[i] = &api.BatchItem{
-			BaseIndexes:  *indexes[i],
-			BaseContents: *contents[i],
-			ProcessorID:  processorID,
-			Priority:     priority,
-			Epoch:        epoch,
+			BaseIndexes:      *indexes[i],
+			BaseContents:     *contents[i],
+			ProcessorID:      processorID,
+			Priority:         priority,
+			Epoch:            epoch,
+			RecoveryAttempts: recoveryAttempts,
 		}
 	}
 

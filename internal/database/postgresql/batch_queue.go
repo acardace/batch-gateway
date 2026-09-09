@@ -116,7 +116,8 @@ func (c *PostgresBatchQueueClient) PQDequeue(ctx context.Context, _ time.Duratio
 		)
 		UPDATE batch_items
 		SET processor_id = $2,
-		    epoch = epoch + 1
+		    epoch = epoch + 1,
+		    recovery_attempts = 0
 		FROM claimed
 		WHERE batch_items.id = claimed.id
 		RETURNING batch_items.id, batch_items.priority, batch_items.epoch`,
@@ -146,6 +147,47 @@ func (c *PostgresBatchQueueClient) PQDequeue(ctx context.Context, _ time.Duratio
 
 	if len(result) > 0 {
 		logger.V(logging.DEBUG).Info("PQDequeue: claimed jobs", "count", len(result))
+	}
+	return result, nil
+}
+
+// PQClaimOwned bumps the epoch and recovery counter of every non-terminal job
+// this processor already owns and returns them for startup recovery.
+func (c *PostgresBatchQueueClient) PQClaimOwned(ctx context.Context) ([]*api.BatchJobPriority, error) {
+	if c.processorID == "" {
+		return nil, fmt.Errorf("PQClaimOwned: processor ID is empty, only processors can claim")
+	}
+	rows, err := c.pool.Query(ctx,
+		`UPDATE batch_items
+		SET epoch = epoch + 1,
+		    recovery_attempts = recovery_attempts + 1
+		WHERE processor_id = $1
+		  AND status IS NOT NULL
+		  AND `+nonTerminalCondition+`
+		RETURNING id, COALESCE(priority, 0), epoch, recovery_attempts`,
+		c.processorID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("PQClaimOwned: %w", err)
+	}
+	defer rows.Close()
+
+	var result []*api.BatchJobPriority
+	for rows.Next() {
+		var id string
+		var priority, epoch, attempts int64
+		if err := rows.Scan(&id, &priority, &epoch, &attempts); err != nil {
+			return nil, fmt.Errorf("PQClaimOwned: scan: %w", err)
+		}
+		result = append(result, &api.BatchJobPriority{
+			ID:               id,
+			SLO:              time.UnixMicro(priority),
+			Epoch:            epoch,
+			RecoveryAttempts: attempts,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("PQClaimOwned: rows: %w", err)
 	}
 	return result, nil
 }

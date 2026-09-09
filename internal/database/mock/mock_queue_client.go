@@ -36,12 +36,22 @@ type MockBatchPriorityQueueClient struct {
 	// queue. This mirrors the Postgres PQDelete behavior of atomically
 	// transitioning the job to cancelled in the DB.
 	OnDelete func(ctx context.Context, id string) error
+
+	// OnClaimOwned backs PQClaimOwned; nil means no owned jobs.
+	OnClaimOwned func(ctx context.Context) ([]*api.BatchJobPriority, error)
 }
 
 func NewMockBatchPriorityQueueClient() *MockBatchPriorityQueueClient {
 	return &MockBatchPriorityQueueClient{
 		queue: make([]*api.BatchJobPriority, 0),
 	}
+}
+
+func (m *MockBatchPriorityQueueClient) PQClaimOwned(ctx context.Context) ([]*api.BatchJobPriority, error) {
+	if m.OnClaimOwned == nil {
+		return nil, nil
+	}
+	return m.OnClaimOwned(ctx)
 }
 
 func (m *MockBatchPriorityQueueClient) PQEnqueue(ctx context.Context, jobPriority *api.BatchJobPriority) error {

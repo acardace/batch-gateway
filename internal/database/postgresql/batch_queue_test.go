@@ -93,6 +93,49 @@ func TestPQEnqueue(t *testing.T) {
 	})
 }
 
+func TestPQClaimOwned(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("returns owned jobs with bumped epoch and attempts", func(t *testing.T) {
+		client, mock := newTestQueueClient(t)
+		defer mock.Close()
+
+		mock.ExpectQuery("UPDATE batch_items").
+			WithArgs(testProcessorID).
+			WillReturnRows(pgxmock.NewRows([]string{"id", "priority", "epoch", "recovery_attempts"}).
+				AddRow("batch-1", int64(1234567890123456), int64(4), int64(2)))
+
+		jobs, err := client.PQClaimOwned(ctx)
+		if err != nil {
+			t.Fatalf("PQClaimOwned: %v", err)
+		}
+		if len(jobs) != 1 {
+			t.Fatalf("expected 1 job, got %d", len(jobs))
+		}
+		if jobs[0].ID != "batch-1" || jobs[0].Epoch != 4 || jobs[0].RecoveryAttempts != 2 {
+			t.Errorf("unexpected job: %+v", jobs[0])
+		}
+		if !jobs[0].SLO.Equal(time.UnixMicro(1234567890123456)) {
+			t.Errorf("SLO: got %v, want %v", jobs[0].SLO, time.UnixMicro(1234567890123456))
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatalf("unmet expectations: %v", err)
+		}
+	})
+
+	t.Run("returns error when processor ID is empty", func(t *testing.T) {
+		mock, err := pgxmock.NewPool()
+		if err != nil {
+			t.Fatalf("failed to create pgxmock pool: %v", err)
+		}
+		defer mock.Close()
+		client := &PostgresBatchQueueClient{pgCore: &pgCore{pool: mock, desc: batchDescriptor{}}}
+		if _, err := client.PQClaimOwned(ctx); err == nil {
+			t.Fatal("expected error for empty processor ID")
+		}
+	})
+}
+
 func TestPQDequeue(t *testing.T) {
 	ctx := context.Background()
 

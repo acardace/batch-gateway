@@ -59,55 +59,70 @@ type recoveryResult struct {
 	cancelPhase  string // non-empty → RecordCancellation is called
 }
 
-// recoverOwnedJobs queries the DB for non-terminal jobs owned by this processor
+// recoverOwnedJobs claims every non-terminal job owned by this processor
 // (via processor_id) and recovers them. This handles both container-level crashes
 // (where emptyDir survives) and pod-level restarts within a StatefulSet (where
 // the processor identity is preserved across restarts).
+//
+// The claim bumps the fencing epoch and the recovery attempt counter of each
+// job in one atomic UPDATE. recoverJob re-reads the row afterwards, so recovery
+// writes at the new epoch and a zombie holding the previous one is fenced out.
 //
 // Runs once at startup before the polling loop.
 func (p *Processor) recoverOwnedJobs(ctx context.Context) {
 	logger := logr.FromContextOrDiscard(ctx)
 
-	const pageSize = 1000
-	var items []*db.BatchItem
-	cursor := 0
-	for {
-		batch, nextCursor, more, err := p.batchDB.DBGet(ctx, &db.BatchQuery{
-			ProcessorID: p.processorID,
-			NonTerminal: true,
-		}, false, cursor, pageSize)
-		if err != nil {
-			logger.Error(err, "Startup recovery: failed to query owned jobs")
-			return
-		}
-		items = append(items, batch...)
-		if !more {
-			break
-		}
-		cursor = nextCursor
+	tasks, err := p.poller.claimOwned(ctx)
+	if err != nil {
+		logger.Error(err, "Startup recovery: failed to claim owned jobs")
+		return
 	}
 
-	if len(items) == 0 {
+	if len(tasks) == 0 {
 		logger.V(logging.DEBUG).Info("Startup recovery: no owned jobs found")
 		return
 	}
 
-	logger.V(logging.INFO).Info("Startup recovery: found owned jobs", "count", len(items))
+	logger.V(logging.INFO).Info("Startup recovery: found owned jobs", "count", len(tasks))
 
 	var grp errgroup.Group
 	grp.SetLimit(p.cfg.Concurrency.Recovery)
 
-	for _, item := range items {
+	for _, task := range tasks {
 		grp.Go(func() error {
-			jlogger := logger.WithValues("jobId", item.ID)
+			jlogger := logger.WithValues("jobId", task.ID, "recoveryAttempts", task.RecoveryAttempts)
 			jctx := logr.NewContext(ctx, jlogger)
-			if recoverErr := p.recoverJob(jctx, item.ID); recoverErr != nil {
+			if task.RecoveryAttempts > maxRecoveryAttempts {
+				if failErr := p.recoverExhausted(jctx, task.ID); failErr != nil {
+					jlogger.Error(failErr, "Startup recovery: failed to fail job past its recovery budget")
+				}
+				return nil
+			}
+			if recoverErr := p.recoverJob(jctx, task.ID); recoverErr != nil {
 				jlogger.Error(recoverErr, "Startup recovery: failed to recover owned job")
 			}
 			return nil
 		})
 	}
 	_ = grp.Wait()
+}
+
+// maxRecoveryAttempts bounds how often one ownership may recover a job before
+// it is failed with whatever partial results survived.
+const maxRecoveryAttempts = 3
+
+// recoverExhausted fails a job whose recovery budget is spent.
+func (p *Processor) recoverExhausted(ctx context.Context, jobID string) error {
+	dbItem, err := p.poller.fetchJobItemByID(ctx, jobID)
+	if err != nil {
+		return err
+	}
+	if dbItem == nil {
+		return nil
+	}
+	jobInfo, _ := batch_utils.FromDBItemToJobInfoObject(dbItem)
+	logr.FromContextOrDiscard(ctx).Info("Startup recovery: recovery budget exhausted, failing job")
+	return p.recoverWithFailed(ctx, dbItem, fmt.Errorf("recovery attempts exhausted after %d", maxRecoveryAttempts), nil, jobInfo)
 }
 
 // recoverJob is the single routing point for startup recovery. Each recover*

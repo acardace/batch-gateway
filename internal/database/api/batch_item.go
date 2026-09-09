@@ -39,6 +39,10 @@ type BatchItem struct {
 	// in addition to checking it. Set by the GC reconciler when reclaiming
 	// an orphan — this is an ownership change (like a Raft term bump).
 	BumpEpoch bool
+
+	// RecoveryAttempts counts startup recoveries under the current ownership.
+	// Reset on dequeue, incremented by PQClaimOwned.
+	RecoveryAttempts int64
 }
 
 // BatchQuery specifies parameters for retrieving batches from the database.

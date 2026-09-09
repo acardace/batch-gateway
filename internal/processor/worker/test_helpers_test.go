@@ -170,6 +170,35 @@ func (d *dbStoreErrFileClient) DBStore(_ context.Context, _ *db.FileItem) error 
 // Spy wrappers
 // ---------------------------------------------------------------------------
 
+// mockClaimOwned mirrors PostgresBatchQueueClient.PQClaimOwned on the mock DB:
+// every non-terminal job owned by processorID gets its epoch and recovery
+// counter bumped and is returned as a task.
+func mockClaimOwned(batchDB db.BatchDBClient, processorID string) func(context.Context) ([]*db.BatchJobPriority, error) {
+	return func(ctx context.Context) ([]*db.BatchJobPriority, error) {
+		items, _, _, err := batchDB.DBGet(ctx, &db.BatchQuery{ProcessorID: processorID, NonTerminal: true}, true, 0, 1000)
+		if err != nil {
+			return nil, err
+		}
+		var tasks []*db.BatchJobPriority
+		for _, item := range items {
+			if item.ProcessorID != processorID {
+				continue
+			}
+			var info openai.BatchStatusInfo
+			if err := json.Unmarshal(item.Status, &info); err != nil || info.Status.IsTerminal() {
+				continue
+			}
+			item.Epoch++
+			item.RecoveryAttempts++
+			if err := batchDB.DBUpdate(ctx, item, nil); err != nil {
+				return nil, err
+			}
+			tasks = append(tasks, &db.BatchJobPriority{ID: item.ID, SLO: time.UnixMicro(item.Priority), Epoch: item.Epoch, RecoveryAttempts: item.RecoveryAttempts})
+		}
+		return tasks, nil
+	}
+}
+
 type spyPQ struct {
 	inner          db.BatchPriorityQueueClient
 	mu             sync.Mutex
@@ -207,6 +236,9 @@ func (s *spyPQ) PQDelete(ctx context.Context, jobPriority *db.BatchJobPriority) 
 }
 func (s *spyPQ) GetContext(parentCtx context.Context, timeLimit time.Duration) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(parentCtx, timeLimit)
+}
+func (s *spyPQ) PQClaimOwned(ctx context.Context) ([]*db.BatchJobPriority, error) {
+	return s.inner.PQClaimOwned(ctx)
 }
 func (s *spyPQ) PQGetIDs(ctx context.Context) (map[string]bool, error) {
 	return s.inner.PQGetIDs(ctx)

@@ -25,6 +25,7 @@ func newRecoveryTestProcessor(t *testing.T, workDir string) (*Processor, db.Batc
 
 	batchDB := newMockBatchDBClient()
 	pq := mockdb.NewMockBatchPriorityQueueClient()
+	pq.OnClaimOwned = mockClaimOwned(batchDB, "test-processor")
 	spyQueue := &spyPQ{inner: pq}
 	statusClient := mockdb.NewMockBatchStatusClient()
 
@@ -170,6 +171,7 @@ func newRecoveryTestProcessorWithQueryFilter(t *testing.T, workDir string) (*Pro
 	}
 
 	pq := mockdb.NewMockBatchPriorityQueueClient()
+	pq.OnClaimOwned = mockClaimOwned(batchDB, "test-processor")
 	spyQueue := &spyPQ{inner: pq}
 	statusClient := mockdb.NewMockBatchStatusClient()
 
@@ -258,15 +260,12 @@ func TestRecoverOwnedJobs(t *testing.T) {
 		p.recoverOwnedJobs(ctx)
 	})
 
-	t.Run("paginates when owned jobs exceed page size", func(t *testing.T) {
+	t.Run("claims every owned job in one call", func(t *testing.T) {
 		workDir := t.TempDir()
 		p, batchDB, spyQueue := newRecoveryTestProcessorWithQueryFilter(t, workDir)
 
-		pagedDB := &pageSizeBatchDB{inner: batchDB, maxPageSize: 2}
-		p.batchDB = pagedDB
-
 		for i := 1; i <= 5; i++ {
-			id := fmt.Sprintf("paged-%d", i)
+			id := fmt.Sprintf("owned-%d", i)
 			seedDBJobWithStatus(t, batchDB, id, "tenant-1", openai.BatchStatusInProgress, nil)
 			setProcessorID(t, batchDB, id, p.processorID)
 			createJobDir(t, p, id, "tenant-1")
@@ -276,39 +275,44 @@ func TestRecoverOwnedJobs(t *testing.T) {
 		p.recoverOwnedJobs(ctx)
 
 		if spyQueue.EnqueueCalls() != 5 {
-			t.Errorf("expected 5 re-enqueue calls across pages, got %d", spyQueue.EnqueueCalls())
-		}
-		if pagedDB.getCalls < 3 {
-			t.Errorf("expected at least 3 DBGet calls for 5 items with page size 2, got %d", pagedDB.getCalls)
+			t.Errorf("expected 5 re-enqueue calls, got %d", spyQueue.EnqueueCalls())
 		}
 	})
-}
 
-type pageSizeBatchDB struct {
-	inner       db.BatchDBClient
-	maxPageSize int
-	getCalls    int
-}
+	t.Run("fails job past its recovery budget", func(t *testing.T) {
+		workDir := t.TempDir()
+		p, batchDB, _ := newRecoveryTestProcessorWithQueryFilter(t, workDir)
 
-func (p *pageSizeBatchDB) DBStore(ctx context.Context, item *db.BatchItem) error {
-	return p.inner.DBStore(ctx, item)
-}
-func (p *pageSizeBatchDB) DBGet(ctx context.Context, query *db.BatchQuery, includeStatic bool, start, limit int) ([]*db.BatchItem, int, bool, error) {
-	p.getCalls++
-	effectiveLimit := limit
-	if p.maxPageSize > 0 && (limit <= 0 || limit > p.maxPageSize) {
-		effectiveLimit = p.maxPageSize
-	}
-	return p.inner.DBGet(ctx, query, includeStatic, start, effectiveLimit)
-}
-func (p *pageSizeBatchDB) DBUpdate(ctx context.Context, item *db.BatchItem, expectedStatus []byte) error {
-	return p.inner.DBUpdate(ctx, item, expectedStatus)
-}
-func (p *pageSizeBatchDB) DBDelete(ctx context.Context, ids []string) ([]string, error) {
-	return p.inner.DBDelete(ctx, ids)
-}
-func (p *pageSizeBatchDB) Close() error {
-	return p.inner.Close()
+		id := "poison-1"
+		seedDBJobWithStatus(t, batchDB, id, "tenant-1", openai.BatchStatusFinalizing, &openai.BatchRequestCounts{Total: 10, Completed: 10})
+		setProcessorID(t, batchDB, id, p.processorID)
+
+		// Set attempts to the budget: PQClaimOwned bumps it past.
+		items, _, _, err := batchDB.DBGet(context.Background(), &db.BatchQuery{BaseQuery: db.BaseQuery{IDs: []string{id}}}, true, 0, 1)
+		if err != nil || len(items) != 1 {
+			t.Fatalf("DBGet: %v", err)
+		}
+		items[0].RecoveryAttempts = maxRecoveryAttempts
+		if err := batchDB.DBUpdate(context.Background(), items[0], nil); err != nil {
+			t.Fatalf("DBUpdate: %v", err)
+		}
+		createJobDir(t, p, id, "tenant-1")
+
+		ctx := testLoggerCtx(t)
+		p.recoverOwnedJobs(ctx)
+
+		items, _, _, err = batchDB.DBGet(context.Background(), &db.BatchQuery{BaseQuery: db.BaseQuery{IDs: []string{id}}}, true, 0, 1)
+		if err != nil || len(items) != 1 {
+			t.Fatalf("DBGet: %v", err)
+		}
+		var info openai.BatchStatusInfo
+		if err := json.Unmarshal(items[0].Status, &info); err != nil {
+			t.Fatalf("unmarshal status: %v", err)
+		}
+		if info.Status != openai.BatchStatusFailed {
+			t.Errorf("job past its recovery budget should be failed, got %s", info.Status)
+		}
+	})
 }
 
 // setProcessorID updates a stored BatchItem's ProcessorID in the mock DB.
@@ -996,6 +1000,7 @@ func TestRecoverOwnedJobs_RunsConcurrently(t *testing.T) {
 		delay:         50 * time.Millisecond,
 	}
 	pq := mockdb.NewMockBatchPriorityQueueClient()
+	pq.OnClaimOwned = mockClaimOwned(innerDB, "test-processor")
 	statusClient := mockdb.NewMockBatchStatusClient()
 
 	cfg := config.NewConfig()
@@ -1017,13 +1022,12 @@ func TestRecoverOwnedJobs_RunsConcurrently(t *testing.T) {
 	p.poller = NewPoller(pq, slowDB)
 	p.updater = NewStatusUpdater(slowDB, statusClient, 86400)
 
-	// Create 5 owned jobs with terminal status (completed) so
-	// recovery just cleans them up after the DB lookup.
+	// Create 5 owned cancelling jobs; each recovery does one DB lookup.
 	numJobs := 5
 	tenantID := "tenant-conc"
 	for i := 0; i < numJobs; i++ {
 		jobID := fmt.Sprintf("job-conc-%d", i)
-		seedDBJobWithStatus(t, innerDB, jobID, tenantID, openai.BatchStatusCompleted, nil)
+		seedDBJobWithStatus(t, innerDB, jobID, tenantID, openai.BatchStatusCancelling, nil)
 		// Set processor_id so recoverOwnedJobs finds them.
 		items, _, _, _ := innerDB.DBGet(context.Background(),
 			&db.BatchQuery{BaseQuery: db.BaseQuery{IDs: []string{jobID}}}, true, 0, 1)

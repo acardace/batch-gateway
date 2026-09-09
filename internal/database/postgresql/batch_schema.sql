@@ -20,13 +20,15 @@ CREATE TABLE IF NOT EXISTS batch_items (
     status        JSONB,
     processor_id  TEXT,
     priority      BIGINT,
-    epoch         BIGINT NOT NULL DEFAULT 0
+    epoch         BIGINT NOT NULL DEFAULT 0,
+    recovery_attempts BIGINT NOT NULL DEFAULT 0
 );
 
 -- Schema migration for existing tables from previous versions.
 ALTER TABLE batch_items ADD COLUMN IF NOT EXISTS processor_id TEXT;
 ALTER TABLE batch_items ADD COLUMN IF NOT EXISTS priority BIGINT;
 ALTER TABLE batch_items ADD COLUMN IF NOT EXISTS epoch BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE batch_items ADD COLUMN IF NOT EXISTS recovery_attempts BIGINT NOT NULL DEFAULT 0;
 
 CREATE INDEX IF NOT EXISTS idx_batch_items_tenant_id ON batch_items(tenant_id);
 CREATE INDEX IF NOT EXISTS idx_batch_items_expiry ON batch_items(expiry) WHERE expiry IS NOT NULL;
