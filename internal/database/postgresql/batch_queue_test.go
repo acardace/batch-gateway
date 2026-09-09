@@ -18,6 +18,7 @@ package postgresql
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -58,6 +59,19 @@ func TestPQEnqueue(t *testing.T) {
 		}
 		if err := mock.ExpectationsWereMet(); err != nil {
 			t.Fatalf("unmet expectations: %v", err)
+		}
+	})
+
+	t.Run("returns conflict when the job is not owned or is terminal", func(t *testing.T) {
+		client, mock := newTestQueueClient(t)
+		defer mock.Close()
+
+		mock.ExpectExec("WITH re_enqueued AS").
+			WithArgs("batch-1").
+			WillReturnResult(pgxmock.NewResult("UPDATE", 0))
+
+		if err := client.PQEnqueue(ctx, &api.BatchJobPriority{ID: "batch-1"}); !errors.Is(err, api.ErrConflict) {
+			t.Fatalf("expected ErrConflict for a no-op re-enqueue, got %v", err)
 		}
 	})
 

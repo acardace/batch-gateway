@@ -63,6 +63,9 @@ func (c *PostgresBatchQueueClient) Close() error {
 // epoch to fence out any zombie writes from the previous owner.
 // The UPDATE is guarded to only affect non-terminal jobs that are currently claimed
 // by a processor, preventing accidental resurrection of completed/failed work.
+// If the guard matches nothing (job already terminal, or already back in the
+// queue) it returns api.ErrConflict so callers can distinguish a no-op from a
+// real re-enqueue.
 func (c *PostgresBatchQueueClient) PQEnqueue(ctx context.Context, jobPriority *api.BatchJobPriority) error {
 	if jobPriority == nil {
 		return fmt.Errorf("PQEnqueue: nil job priority")
@@ -70,7 +73,7 @@ func (c *PostgresBatchQueueClient) PQEnqueue(ctx context.Context, jobPriority *a
 	if jobPriority.ID == "" {
 		return fmt.Errorf("PQEnqueue: empty job ID")
 	}
-	_, err := c.pool.Exec(ctx,
+	result, err := c.pool.Exec(ctx,
 		`WITH re_enqueued AS (
 			UPDATE batch_items
 			SET processor_id = NULL,
@@ -79,14 +82,18 @@ func (c *PostgresBatchQueueClient) PQEnqueue(ctx context.Context, jobPriority *a
 			WHERE id = $1
 			  AND processor_id IS NOT NULL
 			  AND `+nonTerminalCondition+`
+			RETURNING id
 		)
 		-- TODO: the processor polling loop (worker.go) could LISTEN on this channel
 		-- to wake up immediately instead of waiting for the next poll interval.
-		SELECT pg_notify('batch_jobs_available', '')`,
+		SELECT pg_notify('batch_jobs_available', '') FROM re_enqueued`,
 		jobPriority.ID,
 	)
 	if err != nil {
 		return fmt.Errorf("PQEnqueue: %w", err)
+	}
+	if result.RowsAffected() == 0 {
+		return fmt.Errorf("PQEnqueue: %s is not owned or already terminal: %w", jobPriority.ID, api.ErrConflict)
 	}
 	return nil
 }
