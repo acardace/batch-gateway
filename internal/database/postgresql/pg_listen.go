@@ -19,6 +19,7 @@ package postgresql
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -47,6 +48,7 @@ type pgListener struct {
 	done      chan struct{}
 
 	listenErrLogged bool
+	deferred        atomic.Int64
 }
 
 func newPGListener(pool *pgxpool.Pool, channel string, logger logr.Logger, onReconnect func()) *pgListener {
@@ -100,6 +102,11 @@ func (l *pgListener) deliver(payload string) {
 		select {
 		case ch <- payload:
 		default:
+			// The subscriber cannot keep up. The event is not lost — its row
+			// stays in batch_events and the dispatcher's periodic rescan
+			// delivers it — but log so the deferral is visible.
+			l.deferred.Add(1)
+			l.logger.V(logging.INFO).Info("pgListener: subscriber buffer full, deferring event to rescan", "channel", l.channel, "totalDeferred", l.deferred.Load())
 		}
 	}
 }

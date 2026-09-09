@@ -24,6 +24,7 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/pashagolub/pgxmock/v4"
 
 	"github.com/llm-d/llm-d-batch-gateway/internal/database/api"
 )
@@ -113,6 +114,69 @@ func TestPostgresBatchEventClient_ConsumerSubscription(t *testing.T) {
 		}
 	default:
 		t.Fatal("expected event in subscriber channel")
+	}
+}
+
+// TestPostgresBatchEventClient_BackstopRescan verifies that the dispatcher's
+// periodic rescan delivers an event even when no NOTIFY arrives: the row is
+// drained by the rescan tick, never by the subscription's one-shot proactive
+// drain (which is made to return no rows), so a missed notification defers
+// the event to the rescan instead of losing it.
+func TestPostgresBatchEventClient_BackstopRescan(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	c := &PostgresBatchEventClient{
+		pool:           mock,
+		logger:         logr.Discard(),
+		eventSubs:      make(map[string]*eventSub),
+		eventsDone:     make(chan struct{}),
+		rescanInterval: 50 * time.Millisecond,
+	}
+
+	dispCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		// No wake channel traffic: only the rescan tick can deliver.
+		c.runEventDispatcher(dispCtx, make(chan string, 1), func() {})
+	}()
+
+	const jobID = "job-rescan"
+	// Proactive drain at subscription time: nothing in the table yet.
+	mock.ExpectQuery("DELETE FROM batch_events").
+		WithArgs(jobID).
+		WillReturnRows(pgxmock.NewRows([]string{"event_type"}))
+
+	events, err := c.ECConsumerGetChannel(context.Background(), jobID)
+	if err != nil {
+		t.Fatalf("ECConsumerGetChannel: %v", err)
+	}
+	defer events.CloseFn()
+
+	// Let in-flight ticks settle, then put the event "in the table": the next
+	// drain (which can only be a rescan tick by now) returns it.
+	time.Sleep(60 * time.Millisecond)
+	mock.ExpectQuery("DELETE FROM batch_events").
+		WithArgs(jobID).
+		WillReturnRows(pgxmock.NewRows([]string{"event_type"}).AddRow(int(api.BatchEventCancel)))
+
+	select {
+	case ev := <-events.Events:
+		if ev.ID != jobID || ev.Type != api.BatchEventCancel {
+			t.Fatalf("unexpected event: %+v", ev)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("event not delivered by the periodic rescan within 2s")
+	}
+
+	cancel()
+	select {
+	case <-c.eventsDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("dispatcher did not stop after cancel")
 	}
 }
 
