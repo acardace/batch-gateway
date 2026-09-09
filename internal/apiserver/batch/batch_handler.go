@@ -21,6 +21,7 @@ package batch
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -534,7 +535,13 @@ func (c *BatchAPIHandler) CancelBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := c.clients.BatchDB.DBUpdate(ctx, dbItem, nil); err != nil {
+	dbItem.Epoch = item.Epoch
+	if err := c.clients.BatchDB.DBUpdate(ctx, dbItem, item.Status); err != nil {
+		if errors.Is(err, api.ErrConflict) {
+			apiErr := openai.NewAPIError(http.StatusConflict, "", "batch changed state during cancel, retry", nil)
+			common.WriteAPIError(w, r, apiErr)
+			return
+		}
 		logger.Error(err, "failed to update batch in database")
 		common.WriteInternalServerError(w, r)
 		return
