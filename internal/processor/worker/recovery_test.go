@@ -20,7 +20,7 @@ import (
 	"github.com/llm-d/llm-d-batch-gateway/pkg/clients/inference"
 )
 
-func newRecoveryTestProcessor(t *testing.T, workDir string) (*Processor, db.BatchDBClient, *spyPQ) {
+func newRecoveryTestProcessor(t *testing.T, workDir string) (*Processor, db.BatchProgressDBClient, *spyPQ) {
 	t.Helper()
 
 	batchDB := newMockBatchDBClient()
@@ -48,14 +48,14 @@ func newRecoveryTestProcessor(t *testing.T, workDir string) (*Processor, db.Batc
 	return p, batchDB, spyQueue
 }
 
-func seedDBJobWithStatus(t *testing.T, dbClient db.BatchDBClient, jobID, tenantID string, status openai.BatchStatus, counts *openai.BatchRequestCounts) {
+func seedDBJobWithStatus(t *testing.T, dbClient db.BatchProgressDBClient, jobID, tenantID string, status openai.BatchStatus, counts *openai.BatchRequestCounts) {
 	t.Helper()
 
 	slo := time.Now().UTC().Add(24 * time.Hour)
 	seedDBJobWithStatusAndSLO(t, dbClient, jobID, tenantID, status, counts, slo)
 }
 
-func seedDBJobWithStatusAndSLO(t *testing.T, dbClient db.BatchDBClient, jobID, tenantID string, status openai.BatchStatus, counts *openai.BatchRequestCounts, slo time.Time) {
+func seedDBJobWithStatusAndSLO(t *testing.T, dbClient db.BatchProgressDBClient, jobID, tenantID string, status openai.BatchStatus, counts *openai.BatchRequestCounts, slo time.Time) {
 	t.Helper()
 
 	expiresAt := slo.Unix()
@@ -128,7 +128,7 @@ func assertJobDirRemoved(t *testing.T, p *Processor, jobID, tenantID string) {
 	}
 }
 
-func getDBJobStatus(t *testing.T, dbClient db.BatchDBClient, jobID string) openai.BatchStatus {
+func getDBJobStatus(t *testing.T, dbClient db.BatchProgressDBClient, jobID string) openai.BatchStatus {
 	t.Helper()
 	items, _, _, err := dbClient.DBGet(context.Background(),
 		&db.BatchQuery{BaseQuery: db.BaseQuery{IDs: []string{jobID}}},
@@ -696,7 +696,7 @@ func TestRecoverJob_NotInDB_CleansUp(t *testing.T) {
 // failOnNthBatchDB wraps a BatchDBClient and fails DBUpdate on the nth call only.
 // All other calls are delegated to the inner client.
 type failOnNthBatchDB struct {
-	db.BatchDBClient
+	db.BatchProgressDBClient
 	mu      sync.Mutex
 	callN   int
 	failOn  int // 1-based: which call number to fail
@@ -711,7 +711,7 @@ func (f *failOnNthBatchDB) DBUpdate(ctx context.Context, item *db.BatchItem, exp
 	if n == f.failOn {
 		return f.failErr
 	}
-	return f.BatchDBClient.DBUpdate(ctx, item, expectedStatus)
+	return f.BatchProgressDBClient.DBUpdate(ctx, item, expectedStatus)
 }
 
 // failPQ wraps a BatchPriorityQueueClient and always fails PQEnqueue.
@@ -724,14 +724,14 @@ func (f *failPQ) PQEnqueue(_ context.Context, _ *db.BatchJobPriority) error {
 	return f.err
 }
 
-func newRecoveryTestProcessorWithFailDB(t *testing.T, workDir string, failOn int) (*Processor, db.BatchDBClient) {
+func newRecoveryTestProcessorWithFailDB(t *testing.T, workDir string, failOn int) (*Processor, db.BatchProgressDBClient) {
 	t.Helper()
 
 	innerDB := newMockBatchDBClient()
 	failDB := &failOnNthBatchDB{
-		BatchDBClient: innerDB,
-		failOn:        failOn,
-		failErr:       errors.New("db update failed"),
+		BatchProgressDBClient: innerDB,
+		failOn:                failOn,
+		failErr:               errors.New("db update failed"),
 	}
 	pq := mockdb.NewMockBatchPriorityQueueClient()
 
@@ -757,7 +757,7 @@ func newRecoveryTestProcessorWithFailDB(t *testing.T, workDir string, failOn int
 
 // alwaysFailUpdateDB wraps a BatchDBClient where every DBUpdate fails.
 type alwaysFailUpdateDB struct {
-	db.BatchDBClient
+	db.BatchProgressDBClient
 	err error
 }
 
@@ -769,7 +769,7 @@ func TestRecoverJob_Cancelling_AllUpdatesFail_ReturnsError(t *testing.T) {
 	workDir := t.TempDir()
 
 	innerDB := newMockBatchDBClient()
-	failDB := &alwaysFailUpdateDB{BatchDBClient: innerDB, err: errors.New("db update failed")}
+	failDB := &alwaysFailUpdateDB{BatchProgressDBClient: innerDB, err: errors.New("db update failed")}
 	pq := mockdb.NewMockBatchPriorityQueueClient()
 
 	cfg := config.NewConfig()
@@ -896,7 +896,7 @@ func TestRecoverJob_InProgressReEnqueue_EnqueueFails_FallsBackToFailed(t *testin
 	assertJobDirRemoved(t, p, jobID, tenantID)
 }
 
-func getDBJobStatusInfo(t *testing.T, dbClient db.BatchDBClient, jobID string) openai.BatchStatusInfo {
+func getDBJobStatusInfo(t *testing.T, dbClient db.BatchProgressDBClient, jobID string) openai.BatchStatusInfo {
 	t.Helper()
 	items, _, _, err := dbClient.DBGet(context.Background(),
 		&db.BatchQuery{BaseQuery: db.BaseQuery{IDs: []string{jobID}}},
@@ -952,7 +952,7 @@ func TestRecoverJob_Cancelling_UpdateFails_FallbackSucceeds_PreservesCounts(t *t
 // slowBatchDBClient wraps a BatchDBClient and adds a per-DBGet delay
 // while tracking peak concurrency to verify parallel execution.
 type slowBatchDBClient struct {
-	db.BatchDBClient
+	db.BatchProgressDBClient
 	delay     time.Duration
 	mu        sync.Mutex
 	active    int
@@ -973,7 +973,7 @@ func (s *slowBatchDBClient) DBGet(ctx context.Context, query *db.BatchQuery, inc
 	s.active--
 	s.mu.Unlock()
 
-	return s.BatchDBClient.DBGet(ctx, query, includeStatic, start, limit)
+	return s.BatchProgressDBClient.DBGet(ctx, query, includeStatic, start, limit)
 }
 
 func (s *slowBatchDBClient) peakConcurrency() int {
@@ -987,8 +987,8 @@ func TestRecoverOwnedJobs_RunsConcurrently(t *testing.T) {
 
 	innerDB := newMockBatchDBClient()
 	slowDB := &slowBatchDBClient{
-		BatchDBClient: innerDB,
-		delay:         50 * time.Millisecond,
+		BatchProgressDBClient: innerDB,
+		delay:                 50 * time.Millisecond,
 	}
 	pq := mockdb.NewMockBatchPriorityQueueClient()
 	pq.OnClaimOwned = mockClaimOwned(innerDB, "test-processor")
@@ -1166,9 +1166,9 @@ func TestRecoverJob_ExpiredWriteFails_FallbackToFailed(t *testing.T) {
 
 	innerDB := newMockBatchDBClient()
 	failDB := &failOnNthBatchDB{
-		BatchDBClient: innerDB,
-		failOn:        1,
-		failErr:       errors.New("expired write failed"),
+		BatchProgressDBClient: innerDB,
+		failOn:                1,
+		failErr:               errors.New("expired write failed"),
 	}
 	pq := mockdb.NewMockBatchPriorityQueueClient()
 

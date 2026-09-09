@@ -32,10 +32,10 @@ import (
 )
 
 type StatusUpdater struct {
-	db db.BatchDBClient
+	db db.BatchProgressDBClient
 }
 
-func NewStatusUpdater(db db.BatchDBClient) *StatusUpdater {
+func NewStatusUpdater(db db.BatchProgressDBClient) *StatusUpdater {
 	return &StatusUpdater{
 		db: db,
 	}

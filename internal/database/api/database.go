@@ -83,12 +83,6 @@ type DBClient[T any, Q any] interface {
 
 	// DBDelete removes items by their IDs.
 	DBDelete(ctx context.Context, IDs []string) (deletedIDs []string, err error)
-
-	// DBUpdateProgress updates the in-flight request counts in the item's status
-	// column, fenced by the item's current epoch: a write carrying a stale epoch
-	// (e.g. from a fenced-out processor incarnation) matches no rows and is
-	// silently discarded.
-	DBUpdateProgress(ctx context.Context, id string, epoch int64, counts BatchRequestCounts) error
 }
 
 // BatchRequestCounts holds the request progress counts for a batch job.
@@ -96,6 +90,18 @@ type BatchRequestCounts struct {
 	Total     int64 `json:"total"`
 	Completed int64 `json:"completed"`
 	Failed    int64 `json:"failed"`
+}
+
+// BatchProgressDBClient is a BatchDBClient that additionally supports
+// in-flight progress updates.
+type BatchProgressDBClient interface {
+	BatchDBClient
+
+	// DBUpdateProgress updates the in-flight request counts in the item's status
+	// column, fenced by the item's current epoch: a write carrying a stale epoch
+	// (e.g. from a fenced-out processor incarnation) matches no rows and is
+	// silently discarded.
+	DBUpdateProgress(ctx context.Context, id string, epoch int64, counts BatchRequestCounts) error
 }
 
 // Tags are key-value pairs for filtering items.

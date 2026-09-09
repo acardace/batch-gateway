@@ -55,7 +55,7 @@ func mustJSON(t *testing.T, v any) []byte {
 // Mock DB constructors
 // ---------------------------------------------------------------------------
 
-func newMockBatchDBClient() db.BatchDBClient {
+func newMockBatchDBClient() db.BatchProgressDBClient {
 	return mockdb.NewMockDBClient[db.BatchItem, db.BatchQuery](
 		func(b *db.BatchItem) string { return b.ID },
 		func(q *db.BatchQuery) *db.BaseQuery { return &q.BaseQuery },
@@ -173,7 +173,7 @@ func (d *dbStoreErrFileClient) DBStore(_ context.Context, _ *db.FileItem) error 
 // mockClaimOwned mirrors PostgresBatchQueueClient.PQClaimOwned on the mock DB:
 // every non-terminal job owned by processorID gets its epoch and recovery
 // counter bumped and is returned as a task.
-func mockClaimOwned(batchDB db.BatchDBClient, processorID string) func(context.Context) ([]*db.BatchJobPriority, error) {
+func mockClaimOwned(batchDB db.BatchProgressDBClient, processorID string) func(context.Context) ([]*db.BatchJobPriority, error) {
 	return func(ctx context.Context) ([]*db.BatchJobPriority, error) {
 		items, _, _, err := batchDB.DBGet(ctx, &db.BatchQuery{ProcessorID: processorID, NonTerminal: true}, true, 0, 1000)
 		if err != nil {
@@ -258,12 +258,12 @@ func (s *spyPQ) EnqueueCalls() int {
 }
 
 type spyBatchDB struct {
-	inner db.BatchDBClient
+	inner db.BatchProgressDBClient
 	mu    sync.Mutex
 	calls map[openai.BatchStatus]int
 }
 
-func newSpyBatchDB(inner db.BatchDBClient) *spyBatchDB {
+func newSpyBatchDB(inner db.BatchProgressDBClient) *spyBatchDB {
 	return &spyBatchDB{
 		inner: inner,
 		calls: make(map[openai.BatchStatus]int),
@@ -315,7 +315,7 @@ func (s *spyBatchDB) StatusCalls(status openai.BatchStatus) int {
 // failOnStatusDB wraps a BatchDBClient and injects an error when DBUpdate tries
 // to write a specific status. All other operations pass through.
 type failOnStatusDB struct {
-	inner      db.BatchDBClient
+	inner      db.BatchProgressDBClient
 	failStatus openai.BatchStatus
 	failErr    error
 }
@@ -386,7 +386,7 @@ func validProcessorClients(t testing.TB) *clientset.Clientset {
 // testProcessorEnv holds the processor and its mock clients for test inspection.
 type testProcessorEnv struct {
 	p        *Processor
-	dbClient db.BatchDBClient
+	dbClient db.BatchProgressDBClient
 	pqClient db.BatchPriorityQueueClient
 	updater  *StatusUpdater
 }
@@ -430,7 +430,7 @@ func newTestProcessorEnv(t *testing.T, cfg *config.ProcessorConfig, inferClient 
 }
 
 // seedDBJob stores a BatchItem in the DB so the updater can find and update it.
-func seedDBJob(t *testing.T, dbClient db.BatchDBClient, jobID string) *db.BatchItem {
+func seedDBJob(t *testing.T, dbClient db.BatchProgressDBClient, jobID string) *db.BatchItem {
 	t.Helper()
 	statusInfo := openai.BatchStatusInfo{Status: openai.BatchStatusInProgress}
 	statusBytes, _ := json.Marshal(statusInfo)

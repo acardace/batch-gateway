@@ -42,7 +42,7 @@ import (
 // Clientset holds all clients.
 type Clientset struct {
 	File           fsapi.BatchFilesClient
-	BatchDB        dbapi.BatchDBClient
+	BatchDB        dbapi.BatchProgressDBClient
 	FileDB         dbapi.FileDBClient
 	Queue          dbapi.BatchPriorityQueueClient
 	Event          dbapi.BatchEventChannelClient
@@ -92,7 +92,7 @@ func NewS3FileClient(ctx context.Context, cfg *s3client.Config) (fsapi.BatchFile
 
 // NewPostgreSQLDBClients creates PostgreSQL-backed batch and file database clients.
 // It reads the URL from the mounted secrets when not set in the config.
-func NewPostgreSQLDBClients(ctx context.Context, cfg *postgresql.PostgreSQLConfig) (dbapi.BatchDBClient, dbapi.FileDBClient, error) {
+func NewPostgreSQLDBClients(ctx context.Context, cfg *postgresql.PostgreSQLConfig) (dbapi.BatchProgressDBClient, dbapi.FileDBClient, error) {
 	if cfg == nil {
 		return nil, nil, fmt.Errorf("postgresql config cannot be nil")
 	}
