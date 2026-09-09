@@ -18,10 +18,12 @@ package postgresql
 
 import (
 	"context"
+	"os"
 	"testing"
 	"time"
 
 	"github.com/go-logr/logr"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/llm-d/llm-d-batch-gateway/internal/database/api"
 )
@@ -111,5 +113,67 @@ func TestPostgresBatchEventClient_ConsumerSubscription(t *testing.T) {
 		}
 	default:
 		t.Fatal("expected event in subscriber channel")
+	}
+}
+
+// TestPostgresBatchEventClient_PurgeExpiredEvents requires a real PostgreSQL
+// instance (TEST_POSTGRES_URL) and verifies the sweeper's contract: expired,
+// never-consumed rows are deleted, unexpired rows are left alone.
+func TestPostgresBatchEventClient_PurgeExpiredEvents(t *testing.T) {
+	url := os.Getenv("TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("TEST_POSTGRES_URL not set")
+	}
+	ctx := context.Background()
+
+	client, err := NewPostgresBatchEventClient(ctx, &PostgreSQLConfig{Url: url}, logr.Discard())
+	if err != nil {
+		t.Fatalf("NewPostgresBatchEventClient: %v", err)
+	}
+	defer func() { _ = client.Close() }()
+
+	pool, err := pgxpool.New(ctx, url)
+	if err != nil {
+		t.Fatalf("pgxpool: %v", err)
+	}
+	defer pool.Close()
+
+	now := time.Now().Unix()
+	const (
+		expiredJob = "purge-test-expired"
+		liveJob    = "purge-test-live"
+	)
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO batch_events (job_id, event_type, expires_at) VALUES ($1, 1, $2), ($3, 1, $4)`,
+		expiredJob, now-10, liveJob, now+3600); err != nil {
+		t.Fatalf("seed events: %v", err)
+	}
+	defer func() {
+		_, _ = pool.Exec(ctx, `DELETE FROM batch_events WHERE job_id IN ($1, $2)`, expiredJob, liveJob)
+	}()
+
+	purged, err := client.purgeExpiredEvents(ctx)
+	if err != nil {
+		t.Fatalf("purgeExpiredEvents: %v", err)
+	}
+	if purged < 1 {
+		t.Fatalf("purgeExpiredEvents purged %d rows, want >= 1 (the expired test row)", purged)
+	}
+
+	var remaining int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM batch_events WHERE job_id IN ($1, $2)`, expiredJob, liveJob).Scan(&remaining); err != nil {
+		t.Fatalf("count remaining: %v", err)
+	}
+	if remaining != 1 {
+		t.Fatalf("expected exactly the unexpired row to remain, got %d rows", remaining)
+	}
+	var remainingJob string
+	if err := pool.QueryRow(ctx,
+		`SELECT job_id FROM batch_events WHERE job_id IN ($1, $2)`, expiredJob, liveJob).Scan(&remainingJob); err != nil {
+		t.Fatalf("fetch remaining: %v", err)
+	}
+	if remainingJob != liveJob {
+		t.Fatalf("expected %s to remain, got %s", liveJob, remainingJob)
 	}
 }
