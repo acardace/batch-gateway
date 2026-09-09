@@ -469,36 +469,6 @@ func (c *pgCore) delete(ctx context.Context, ids []string) (deletedIDs []string,
 	return deletedIDs, nil
 }
 
-func (c *pgCore) DBUpdateProgress(ctx context.Context, id string, epoch int64, counts api.BatchRequestCounts) error {
-	if id == "" {
-		return fmt.Errorf("DBUpdateProgress: empty ID")
-	}
-	countsJSON, err := json.Marshal(counts)
-	if err != nil {
-		return fmt.Errorf("DBUpdateProgress: marshal counts: %w", err)
-	}
-
-	where := "id = $2"
-	args := []any{string(countsJSON), id}
-	if c.desc.TableName() == "batch_items" {
-		// Same epoch fence as DBUpdate: a stale-epoch writer (a fenced-out
-		// processor incarnation) must not overwrite the current owner's counts.
-		where += " AND " + nonTerminalCondition + " AND " + colEpoch + " = $3"
-		args = append(args, epoch)
-	}
-
-	sql := fmt.Sprintf(
-		"UPDATE %s SET status = jsonb_set(COALESCE(status, '{}'::jsonb), '{request_counts}', $1::jsonb, true) WHERE %s",
-		c.desc.TableName(), where,
-	)
-
-	_, err = c.pool.Exec(ctx, sql, args...)
-	if err != nil {
-		return fmt.Errorf("DBUpdateProgress: %w", err)
-	}
-	return nil
-}
-
 func (c *pgCore) ensureSchema(ctx context.Context) error {
 	_, err := c.pool.Exec(ctx, c.desc.Schema())
 	return err

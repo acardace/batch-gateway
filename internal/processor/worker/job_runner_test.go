@@ -393,7 +393,7 @@ func TestHandlePanicRecovery_NilParams_DoesNotPanic(t *testing.T) {
 // dbBlockingUpdateWrapper blocks DBUpdate until its context is cancelled,
 // simulating an unreachable database.
 type dbBlockingUpdateWrapper struct {
-	inner db.BatchDBClient
+	inner db.BatchProgressDBClient
 }
 
 func (d *dbBlockingUpdateWrapper) DBStore(ctx context.Context, item *db.BatchItem) error {
@@ -584,7 +584,7 @@ func TestRunJob_Success_CompletesAndCleansArtifacts(t *testing.T) {
 	}
 }
 
-func assertJobStatus(t *testing.T, dbClient db.BatchDBClient, jobID string, want openai.BatchStatus) {
+func assertJobStatus(t *testing.T, dbClient db.BatchProgressDBClient, jobID string, want openai.BatchStatus) {
 	t.Helper()
 	items, _, _, err := dbClient.DBGet(context.Background(), &db.BatchQuery{BaseQuery: db.BaseQuery{IDs: []string{jobID}}}, true, 0, 1)
 	if err != nil || len(items) != 1 {
