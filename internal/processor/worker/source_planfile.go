@@ -69,10 +69,12 @@ func NewPlanFileSource(cfg PlanFileSourceConfig) *PlanFileSource {
 	}
 }
 
-// Produce sends one item per plan entry to the channel. It reads the input
-// line so each item retains the original custom_id. Context cancellation is
-// respected during storage reads and channel sends.
-func (s *PlanFileSource) Produce(ctx context.Context, outgoingRequestCh chan<- pipeline.RequestItem) error {
+// Produce sends one item per plan entry to the channel. It always reads the
+// input line so each item retains the original custom_id: cancel / expire
+// drain still needs that identity in the error file even when inference is
+// skipped. Context cancellation is handled by the dispatcher drain path, not
+// here — dropping entries on cancellation would break batch accounting.
+func (s *PlanFileSource) Produce(_ context.Context, outgoingRequestCh chan<- pipeline.RequestItem) error {
 	defer close(outgoingRequestCh)
 
 	for safeModelID, modelID := range s.modelMap.SafeToModel {
@@ -83,7 +85,7 @@ func (s *PlanFileSource) Produce(ctx context.Context, outgoingRequestCh chan<- p
 		}
 
 		for _, entry := range entries {
-			item, err := s.readEntry(ctx, entry, modelID)
+			item, err := s.readEntry(entry, modelID)
 			if err != nil {
 				return err
 			}
@@ -94,25 +96,24 @@ func (s *PlanFileSource) Produce(ctx context.Context, outgoingRequestCh chan<- p
 	return nil
 }
 
-func (s *PlanFileSource) readEntry(ctx context.Context, entry planEntry, modelID string) (*pipeline.RequestItem, error) {
+func (s *PlanFileSource) readEntry(entry planEntry, modelID string) (*pipeline.RequestItem, error) {
 	var buf []byte
 	if s.storage != nil && s.inputRef != nil {
-		reqCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		// The input read enumerates requests for drain accounting, so it must
+		// complete even after the dispatch deadline (SLO expiry / cancel /
+		// shutdown): the dispatcher needs every custom_id to record
+		// batch_expired/batch_cancelled. Use a bounded detached context rather
+		// than the abortable dispatch ctx so cancellation can't drop entries.
+		reqCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		rc, err := s.storage.RetrieveRange(reqCtx, s.inputRef.storageName, s.inputRef.folderName, entry.Offset, int64(entry.Length))
 		if err != nil {
-			if ctx.Err() != nil {
-				return nil, ctx.Err()
-			}
 			return nil, fmt.Errorf("%w at offset %d: %w", errRequestInputRead, entry.Offset, err)
 		}
 		defer rc.Close()
 
 		buf, err = io.ReadAll(rc)
 		if err != nil {
-			if ctx.Err() != nil {
-				return nil, ctx.Err()
-			}
 			return nil, fmt.Errorf("%w at offset %d: %w", errRequestInputRead, entry.Offset, err)
 		}
 	} else if s.inputFile != nil {
