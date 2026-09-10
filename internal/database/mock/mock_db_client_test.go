@@ -19,6 +19,7 @@ package mock
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/llm-d/llm-d-batch-gateway/internal/database/api"
@@ -54,9 +55,10 @@ func TestMockDBClient_DBUpdateProgress_EpochFence(t *testing.T) {
 		return counts
 	}
 
-	// A stale-epoch write must not touch the row.
-	if err := dbClient.DBUpdateProgress(ctx, "job-1", 4, api.BatchRequestCounts{Total: 10, Completed: 1}); err != nil {
-		t.Fatalf("stale-epoch DBUpdateProgress: %v", err)
+	// A stale-epoch write is fenced out: it surfaces ErrConflict and must not
+	// touch the row.
+	if err := dbClient.DBUpdateProgress(ctx, "job-1", 4, api.BatchRequestCounts{Total: 10, Completed: 1}); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("stale-epoch DBUpdateProgress: expected ErrConflict, got %v", err)
 	}
 	if counts := getCounts(t); counts != nil {
 		t.Fatalf("stale-epoch write must not update counts, got %v", counts)

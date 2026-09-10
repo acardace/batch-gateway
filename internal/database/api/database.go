@@ -98,9 +98,9 @@ type BatchProgressDBClient interface {
 	BatchDBClient
 
 	// DBUpdateProgress updates the in-flight request counts in the item's status
-	// column, fenced by the item's current epoch: a write carrying a stale epoch
-	// (e.g. from a fenced-out processor incarnation) matches no rows and is
-	// silently discarded.
+	// column, fenced by the item's current epoch. A write carrying a stale epoch
+	// (e.g. from a fenced-out processor incarnation) matches no rows and returns
+	// ErrConflict, so the caller knows it is no longer the owner and can abort.
 	DBUpdateProgress(ctx context.Context, id string, epoch int64, counts BatchRequestCounts) error
 }
 

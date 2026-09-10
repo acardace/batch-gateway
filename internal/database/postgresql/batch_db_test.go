@@ -480,19 +480,19 @@ func TestBatchUpdateProgress(t *testing.T) {
 		}
 	})
 
-	t.Run("stale epoch write is a silent no-op", func(t *testing.T) {
+	t.Run("stale epoch write surfaces ErrConflict", func(t *testing.T) {
 		client, mock := newTestBatchClient(t)
 		defer mock.Close()
 
-		// Fence mismatch: the UPDATE matches no rows and must not surface
-		// an error (the fenced-out writer's progress is simply discarded).
+		// Fence mismatch: the UPDATE matches no rows. The fenced-out writer must
+		// learn it lost ownership, so the write surfaces ErrConflict.
 		mock.ExpectExec("UPDATE "+testTable+".*epoch = \\$3").
 			WithArgs(pgxmock.AnyArg(), "batch-1", int64(4)).
 			WillReturnResult(pgxmock.NewResult("UPDATE", 0))
 
 		err := client.DBUpdateProgress(ctx, "batch-1", 4, api.BatchRequestCounts{Total: 1})
-		if err != nil {
-			t.Fatalf("stale-epoch write must be silently discarded, got %v", err)
+		if !errors.Is(err, api.ErrConflict) {
+			t.Fatalf("stale-epoch write must surface ErrConflict, got %v", err)
 		}
 		if err := mock.ExpectationsWereMet(); err != nil {
 			t.Fatalf("unmet expectations: %v", err)

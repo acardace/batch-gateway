@@ -10,6 +10,7 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/llm-d/llm-d-batch-gateway/pkg/clients/inference"
 
+	db "github.com/llm-d/llm-d-batch-gateway/internal/database/api"
 	"github.com/llm-d/llm-d-batch-gateway/internal/processor/batchctx"
 	"github.com/llm-d/llm-d-batch-gateway/internal/processor/config"
 	"github.com/llm-d/llm-d-batch-gateway/internal/processor/pipeline"
@@ -29,10 +30,27 @@ type jobProgressUpdater struct {
 	inner epochProgressUpdater
 	jobID string
 	epoch int64
+	// onFencedOut, when non-nil, is invoked when a progress write is fenced out
+	// by an epoch bump (this processor lost ownership). runJob uses it to abort
+	// without a terminal write.
+	onFencedOut func()
 }
 
 func (u jobProgressUpdater) UpdateProgressCounts(ctx context.Context, jobID string, counts *openai.BatchRequestCounts) error {
-	return u.inner.UpdateProgressCounts(ctx, u.jobID, u.epoch, counts)
+	err := u.inner.UpdateProgressCounts(ctx, u.jobID, u.epoch, counts)
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, db.ErrConflict) {
+		// The write was fenced out by an epoch bump: a reclaimer took ownership.
+		// Signal runJob to abort (neutral cause) without a terminal write. Return
+		// nil so the progress tracker does not log a spurious update failure.
+		if u.onFencedOut != nil {
+			u.onFencedOut()
+		}
+		return nil
+	}
+	return err
 }
 
 func (p *Processor) executeJobAsync(ctx context.Context, params *jobExecutionParams) (*openai.BatchRequestCounts, error) {
@@ -81,7 +99,7 @@ func (p *Processor) executeJobAsync(ctx context.Context, params *jobExecutionPar
 
 	tracker := pipeline.NewProgressTracker(
 		modelMap.LineCount,
-		jobProgressUpdater{inner: params.updater, jobID: params.jobInfo.JobID, epoch: jobEpoch},
+		jobProgressUpdater{inner: params.updater, jobID: params.jobInfo.JobID, epoch: jobEpoch, onFencedOut: params.onOwnershipLost},
 		params.jobInfo.JobID,
 		progressInterval,
 		logger,
