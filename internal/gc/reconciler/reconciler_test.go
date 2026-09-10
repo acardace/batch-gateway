@@ -294,6 +294,38 @@ func TestSkipNonOrphans(t *testing.T) {
 	}
 }
 
+func TestRunCycle_RefreshesLiveSetBeforeTriage(t *testing.T) {
+	ctx := context.Background()
+
+	batchDB := newMockBatchDB()
+	queue := mock.NewMockBatchPriorityQueueClient()
+
+	// Owned by "fresh-replica", which is absent from the stale snapshot but is
+	// Ready per the refresher. The cycle must refresh the live set first so this
+	// is not triaged as a false orphan.
+	item := newTestBatchItem("job-1", "fresh-replica", openai.BatchStatusInProgress, futureSLO())
+	storeItems(t, batchDB, item)
+
+	r, resultCh := newTestReconciler(t, batchDB, queue)
+	r.SetLiveProcessors(map[string]bool{"stale-processor": true}) // predates fresh-replica
+
+	refreshed := false
+	r.SetLivePodRefresher(func(context.Context) (map[string]bool, error) {
+		refreshed = true
+		return map[string]bool{"stale-processor": true, "fresh-replica": true}, nil
+	})
+
+	r.run(ctx)
+	result := <-resultCh
+
+	if !refreshed {
+		t.Fatal("expected the live set to be refreshed during the reconcile cycle")
+	}
+	if result.Expired != 0 || result.ReEnqueued != 0 || result.Conflicts != 0 || result.Errors != 0 {
+		t.Errorf("fresh Ready replica must not be triaged as an orphan, got %+v", result)
+	}
+}
+
 func TestRunCycleMixedJobs(t *testing.T) {
 	ctx := context.Background()
 

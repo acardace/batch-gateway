@@ -146,6 +146,11 @@ func run() error {
 			return fmt.Errorf("failed to create pod watcher: %w", err)
 		}
 
+		// Refresh the reconciler's live set from actual pod readiness each cycle,
+		// so a freshly-Ready replica is never a false orphan even before the
+		// StatefulSet reports stable.
+		rec.SetLivePodRefresher(pw.LivePods)
+
 		g.Go(func() error { return pw.Run(gCtx) })
 		g.Go(func() error { return rec.RunLoop(gCtx) })
 	}
