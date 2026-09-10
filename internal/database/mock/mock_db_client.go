@@ -185,10 +185,10 @@ func (m *MockDBClient[T, Q]) DBUpdateProgress(ctx context.Context, id string, ep
 	if existingItem, ok := existing.(*T); ok {
 		val := reflect.ValueOf(existingItem).Elem()
 		// Mirror the Postgres epoch fence: items with an Epoch field are only
-		// updated when the caller carries the current epoch; a stale-epoch
-		// write matches no rows and is silently discarded.
+		// updated when the caller carries the current epoch; a stale-epoch write
+		// matches no rows, so surface ErrConflict to the caller.
 		if epochField := val.FieldByName("Epoch"); epochField.IsValid() && epochField.Kind() == reflect.Int64 && epochField.Int() != epoch {
-			return nil
+			return fmt.Errorf("DBUpdateProgress: %w", api.ErrConflict)
 		}
 		statusField := val.FieldByName("Status")
 		if statusField.IsValid() && statusField.CanSet() && statusField.Kind() == reflect.Slice {
