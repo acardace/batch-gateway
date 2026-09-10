@@ -204,9 +204,15 @@ func (c *PostgresBatchDBClient) DBUpdateProgress(ctx context.Context, id string,
 		c.desc.TableName(),
 	)
 
-	_, err = c.pool.Exec(ctx, sql, string(countsJSON), id, epoch)
+	result, err := c.pool.Exec(ctx, sql, string(countsJSON), id, epoch)
 	if err != nil {
 		return fmt.Errorf("DBUpdateProgress: %w", err)
+	}
+	if result.RowsAffected() == 0 {
+		// The epoch fence matched no row: this processor is no longer the owner
+		// (its epoch was bumped by a reclaimer). Surface it so the caller can
+		// abort instead of dispatching against a job it no longer owns.
+		return fmt.Errorf("DBUpdateProgress: %w", api.ErrConflict)
 	}
 	return nil
 }
