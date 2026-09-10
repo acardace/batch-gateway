@@ -883,7 +883,13 @@ func TestPlanFileSource_Produce_StorageRangedReads_Error(t *testing.T) {
 	}
 }
 
-func TestPlanFileSource_Produce_StorageRangedReads_CancelledContext(t *testing.T) {
+// TestPlanFileSource_Produce_StorageRangedReads_CancelledContextStillProduces
+// verifies that a cancelled context does not stop the storage-backed source
+// from emitting every entry with its original custom_id. The dispatcher drains
+// submitted-but-undispatched requests as batch_expired/batch_cancelled, which
+// requires that identity — it only comes from reading the input line. Aborting
+// the read on cancellation would drop entries and break batch accounting.
+func TestPlanFileSource_Produce_StorageRangedReads_CancelledContextStillProduces(t *testing.T) {
 	dir := t.TempDir()
 
 	requests := []batch_types.Request{
@@ -931,11 +937,18 @@ func TestPlanFileSource_Produce_StorageRangedReads_CancelledContext(t *testing.T
 	cancel()
 
 	out := make(chan pipeline.RequestItem, 10)
-	err := source.Produce(ctx, out)
-	if err == nil {
-		t.Fatal("expected error for cancelled context, got nil")
+	if err := source.Produce(ctx, out); err != nil {
+		t.Fatalf("Produce with cancelled context must still enumerate for the drain path, got: %v", err)
 	}
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("expected context.Canceled, got %v", err)
+
+	var items []pipeline.RequestItem
+	for item := range out {
+		items = append(items, item)
+	}
+	if len(items) != 1 {
+		t.Fatalf("produced %d items, want 1 (drain needs the custom_id even after cancel)", len(items))
+	}
+	if items[0].CustomID != "c-1" {
+		t.Errorf("item 0 CustomID = %q, want %q", items[0].CustomID, "c-1")
 	}
 }
