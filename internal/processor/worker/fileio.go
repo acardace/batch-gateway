@@ -24,6 +24,7 @@ import (
 
 	db "github.com/llm-d/llm-d-batch-gateway/internal/database/api"
 	filesapi "github.com/llm-d/llm-d-batch-gateway/internal/files_store/api"
+	"github.com/llm-d/llm-d-batch-gateway/internal/shared/batchinput"
 	"github.com/llm-d/llm-d-batch-gateway/internal/shared/converter"
 	ucom "github.com/llm-d/llm-d-batch-gateway/internal/util/com"
 
@@ -50,6 +51,11 @@ const (
 type inputFileRef struct {
 	storageName string
 	folderName  string
+
+	// meta is the ordering metadata the API server recorded when it stored the
+	// object. It is nil for files uploaded before that metadata existed, which
+	// callers must treat as "layout unknown" rather than as an error.
+	meta *batchinput.Metadata
 }
 
 func (p *Processor) jobRootDir(jobID, tenantID string) (string, error) {
@@ -132,9 +138,19 @@ func (p *Processor) resolveInputFileCoords(ctx context.Context, inputFileID stri
 		return nil, fmt.Errorf("failed to get folder name by tenant id: %w", err)
 	}
 
+	// Unreadable metadata must not fail the job: the fallback path can always
+	// rebuild everything from the object itself, so log and carry on.
+	meta, err := batchinput.DecodeMetadata(fileItem.Tags)
+	if err != nil {
+		logr.FromContextOrDiscard(ctx).Error(err,
+			"Ignoring unreadable batch input metadata", "fileID", inputFileID)
+		meta = nil
+	}
+
 	return &inputFileRef{
 		storageName: ucom.FileStorageName(fileItem.ID, fileObj.Filename),
 		folderName:  folderName,
+		meta:        meta,
 	}, nil
 }
 

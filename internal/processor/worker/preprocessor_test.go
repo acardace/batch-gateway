@@ -153,15 +153,11 @@ func TestPreProcess_BuildsPlansAndModelMap_OffsetsCorrect(t *testing.T) {
 			if len(chunk) == 0 || chunk[len(chunk)-1] != '\n' {
 				t.Fatalf("entry does not end with newline: safeID=%q off=%d len=%d", safeID, e.Offset, e.Length)
 			}
-			trimmed := bytes.TrimSuffix(chunk, []byte{'\n'})
-			var req planRequestLine
-			if err := json.Unmarshal(trimmed, &req); err != nil {
-				t.Fatalf("entry not valid json: safeID=%q off=%d len=%d err=%v", safeID, e.Offset, e.Length, err)
+			meta, err := extractAndValidateLine(chunk)
+			if err != nil {
+				t.Fatalf("entry not a valid request: safeID=%q off=%d len=%d err=%v", safeID, e.Offset, e.Length, err)
 			}
-			model := req.Body.Model
-			if model == "" {
-				t.Fatalf("entry missing body.model: safeID=%q off=%d", safeID, e.Offset)
-			}
+			model := meta.ModelID
 
 			// And ensure that this model maps to this safeID in model_map.json
 			expectedSafe := mm.ModelToSafe[model]

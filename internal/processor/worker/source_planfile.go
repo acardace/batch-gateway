@@ -1,15 +1,12 @@
 package worker
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"maps"
 	"os"
 	"path/filepath"
-	"strconv"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -18,7 +15,6 @@ import (
 	filesapi "github.com/llm-d/llm-d-batch-gateway/internal/files_store/api"
 	"github.com/llm-d/llm-d-batch-gateway/internal/processor/config"
 	"github.com/llm-d/llm-d-batch-gateway/internal/processor/pipeline"
-	batch_types "github.com/llm-d/llm-d-batch-gateway/internal/shared/types"
 	"github.com/llm-d/llm-d-batch-gateway/pkg/clients/inference"
 )
 
@@ -125,9 +121,8 @@ func (s *PlanFileSource) readEntry(entry planEntry, modelID string) (*pipeline.R
 		return nil, fmt.Errorf("%w: no storage or input file provided", errRequestInputRead)
 	}
 
-	trimmed := bytes.TrimSuffix(buf, []byte{'\n'})
-	var req batch_types.Request
-	if err := json.Unmarshal(trimmed, &req); err != nil {
+	req, err := decodeRequestLine(buf)
+	if err != nil {
 		s.logger.Error(err, "Failed to parse request line, recording as error")
 		reqID := fmt.Sprintf("batch_req_%s", uuid.NewString())
 		return &pipeline.RequestItem{
@@ -153,6 +148,7 @@ func (s *PlanFileSource) readEntry(entry planEntry, modelID string) (*pipeline.R
 		RequestID: fmt.Sprintf("batch_req_%s", uuid.NewString()),
 		CustomID:  req.CustomID,
 		ModelID:   lookupID,
+		ModelName: modelID,
 		Endpoint:  req.URL,
 		Body:      req.Body,
 		Headers:   headers,
@@ -160,26 +156,5 @@ func (s *PlanFileSource) readEntry(entry planEntry, modelID string) (*pipeline.R
 }
 
 func (s *PlanFileSource) mergeHeaders(headers map[string]string, modelID string) map[string]string {
-	if headers == nil {
-		headers = make(map[string]string)
-	}
-
-	if !s.sloDeadline.IsZero() {
-		ms := time.Until(s.sloDeadline).Milliseconds()
-		if ms >= 0 {
-			headers[sloTTFTMSHeader] = strconv.FormatInt(ms, 10)
-		}
-	}
-
-	if obj := s.cfg.InferenceObjectiveFor(modelID); obj != "" {
-		headers[inferenceObjectiveHeader] = obj
-	}
-
-	if s.cfg.SendFairnessHeader && s.tenantID != "" {
-		if _, exists := headers[fairnessIDHeader]; !exists {
-			headers[fairnessIDHeader] = s.tenantID
-		}
-	}
-
-	return headers
+	return mergeDispatchHeaders(headers, s.cfg, modelID, s.tenantID, s.sloDeadline)
 }

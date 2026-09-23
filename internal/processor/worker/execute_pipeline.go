@@ -84,19 +84,40 @@ func (p *Processor) executeJobAsync(ctx context.Context, params *jobExecutionPar
 	)
 	tracker.AddFailed(modelMap.RejectedCount)
 
-	source := NewPlanFileSource(PlanFileSourceConfig{
-		Storage:            storage,
-		InputRef:           inputRef,
-		InputFile:          inputFile,
-		PlansDir:           plansDir,
-		ModelMap:           modelMap,
-		Resolver:           p.inference,
-		Cfg:                p.cfg,
-		PassThroughHeaders: params.jobInfo.PassThroughHeaders,
-		SLODeadline:        sloDeadline,
-		TenantID:           params.jobInfo.TenantID,
-		Logger:             logger,
-	})
+	// Ingestion already decided how the input must be read and recorded it in
+	// the manifest, so execution follows that decision rather than re-deriving
+	// it from the file record.
+	var source pipeline.RequestSource
+	if modelMap.sequentialInput() {
+		source = NewObjectSource(ObjectSourceConfig{
+			Storage:            storage,
+			InputRef:           inputRef,
+			Size:               modelMap.InputBytes,
+			LineCount:          modelMap.LineCount,
+			Policy:             modelMap.InputPolicy,
+			Cfg:                p.cfg,
+			PassThroughHeaders: params.jobInfo.PassThroughHeaders,
+			SLODeadline:        sloDeadline,
+			TenantID:           params.jobInfo.TenantID,
+			Logger:             logger,
+			ChunkSize:          p.cfg.InputChunkSizeBytes,
+			PrefetchBytes:      p.cfg.InputPrefetchBytes,
+		})
+	} else {
+		source = NewPlanFileSource(PlanFileSourceConfig{
+			Storage:            storage,
+			InputRef:           inputRef,
+			InputFile:          inputFile,
+			PlansDir:           plansDir,
+			ModelMap:           modelMap,
+			Resolver:           p.inference,
+			Cfg:                p.cfg,
+			PassThroughHeaders: params.jobInfo.PassThroughHeaders,
+			SLODeadline:        sloDeadline,
+			TenantID:           params.jobInfo.TenantID,
+			Logger:             logger,
+		})
+	}
 
 	// The dispatcher forwards requests for processing.
 	pending := pipeline.NewPendingRequests(modelMap.LineCount)
@@ -153,6 +174,9 @@ func (p *Processor) buildRequestDispatcher(modelMap *modelMapFile, pending *pipe
 	switch {
 	case p.asyncInference != nil:
 		broadcasters := p.broadcasters.forModels(modelMap)
+		if modelMap.sequentialInput() {
+			broadcasters = p.broadcasters.forModelNames(modelMap.InputModels)
+		}
 		async := pipeline.NewAsyncDispatcher(p.asyncInference, broadcasters, pending, logger)
 		return pipeline.NewPreDispatcher(async), nil
 	case p.cfg.Concurrency.AIMD.Enabled:
