@@ -122,6 +122,12 @@ func run() error {
 		}
 	})
 	g.Go(func() error { return gc.RunLoop(gCtx) })
+	if !cfg.DryRun {
+		if clients.EventGC == nil {
+			return fmt.Errorf("event GC is not configured")
+		}
+		g.Go(func() error { return clients.EventGC.Run(gCtx) })
+	}
 
 	if cfg.Reconciler.Enabled {
 		onCycle := func(r *reconciler.Result) {

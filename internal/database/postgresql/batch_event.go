@@ -24,17 +24,15 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/llm-d/llm-d-batch-gateway/internal/database/api"
 	"github.com/llm-d/llm-d-batch-gateway/internal/util/logging"
 )
 
 const (
-	eventChanBufSize = 100
-	channelEvents    = "batch_events"
-
-	// eventSweepInterval is how often expired, never-consumed events are
-	// purged from batch_events.
+	eventChanBufSize   = 100
+	channelEvents      = "batch_events"
 	eventSweepInterval = 30 * time.Second
 
 	// eventRescanInterval is how often the dispatcher re-drains every
@@ -74,10 +72,11 @@ type eventSub struct {
 // The batch_events table is the durable source of truth (late-attach safe);
 // PostgreSQL LISTEN/NOTIFY provides low-latency notification delivery without polling.
 type PostgresBatchEventClient struct {
-	pool      pgxPool
-	listener  *pgListener
-	logger    logr.Logger
-	closeOnce sync.Once
+	pool         pgxPool
+	listener     *pgListener
+	logger       logr.Logger
+	closeOnce    sync.Once
+	producerOnly bool
 
 	eventsMu     sync.Mutex
 	eventSubs    map[string]*eventSub
@@ -86,14 +85,32 @@ type PostgresBatchEventClient struct {
 
 	rescanInterval time.Duration
 	rescanNow      chan struct{}
-
-	sweepCancel context.CancelFunc
-	sweepDone   chan struct{}
 }
 
 var _ api.BatchEventChannelClient = (*PostgresBatchEventClient)(nil)
 
 func NewPostgresBatchEventClient(ctx context.Context, config *PostgreSQLConfig, logger logr.Logger) (*PostgresBatchEventClient, error) {
+	pool, err := newEventPool(ctx, config)
+	if err != nil {
+		return nil, err
+	}
+
+	c := &PostgresBatchEventClient{
+		pool:           pool,
+		logger:         logger,
+		eventSubs:      make(map[string]*eventSub),
+		rescanInterval: eventRescanInterval,
+		rescanNow:      make(chan struct{}, 1),
+	}
+
+	c.listener = newPGListener(pool, channelEvents, logger, c.onReconnect)
+	c.startEventDispatcher()
+
+	logger.V(logging.INFO).Info("NewPostgresBatchEventClient: client created successfully")
+	return c, nil
+}
+
+func newEventPool(ctx context.Context, config *PostgreSQLConfig) (*pgxpool.Pool, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -111,20 +128,7 @@ func NewPostgresBatchEventClient(ctx context.Context, config *PostgreSQLConfig, 
 		return nil, fmt.Errorf("failed to apply batch events schema: %w", err)
 	}
 
-	c := &PostgresBatchEventClient{
-		pool:           pool,
-		logger:         logger,
-		eventSubs:      make(map[string]*eventSub),
-		rescanInterval: eventRescanInterval,
-		rescanNow:      make(chan struct{}, 1),
-	}
-
-	c.listener = newPGListener(pool, channelEvents, logger, c.onReconnect)
-	c.startEventDispatcher()
-	c.startEventSweeper()
-
-	logger.V(logging.INFO).Info("NewPostgresBatchEventClient: client created successfully")
-	return c, nil
+	return pool, nil
 }
 
 func (c *PostgresBatchEventClient) Close() error {
@@ -132,10 +136,6 @@ func (c *PostgresBatchEventClient) Close() error {
 		if c.eventsCancel != nil {
 			c.eventsCancel()
 			<-c.eventsDone
-		}
-		if c.sweepCancel != nil {
-			c.sweepCancel()
-			<-c.sweepDone
 		}
 		if c.listener != nil {
 			_ = c.listener.close()
@@ -147,43 +147,67 @@ func (c *PostgresBatchEventClient) Close() error {
 	return nil
 }
 
-// startEventSweeper periodically purges expired, never-consumed events so the
-// table cannot grow without bound (the drain only removes unexpired rows).
-func (c *PostgresBatchEventClient) startEventSweeper() {
-	sweepCtx, cancel := context.WithCancel(context.Background())
-	c.sweepCancel = cancel
-	c.sweepDone = make(chan struct{})
-
-	go func() {
-		defer close(c.sweepDone)
-		ticker := time.NewTicker(eventSweepInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-sweepCtx.Done():
-				return
-			case <-ticker.C:
-				purged, err := c.purgeExpiredEvents(sweepCtx)
-				if err != nil {
-					c.logger.V(logging.INFO).Info("event sweeper: purge failed", "err", err.Error())
-					continue
-				}
-				if purged > 0 {
-					c.logger.V(logging.INFO).Info("event sweeper: purged expired events", "purged", purged)
-				}
-			}
-		}
-	}()
+// PostgresBatchEventGC sweeps expired events independently of event producers
+// and consumers, sharing the GC process's existing batch database pool.
+type PostgresBatchEventGC struct {
+	pool   pgxPool
+	logger logr.Logger
 }
 
-// purgeExpiredEvents deletes expired, never-consumed events and returns the
-// number of rows removed.
-func (c *PostgresBatchEventClient) purgeExpiredEvents(ctx context.Context) (int64, error) {
-	result, err := c.pool.Exec(ctx, ecPurgeExpiredEventsSQL)
+var _ api.BatchEventGC = (*PostgresBatchEventGC)(nil)
+
+func NewPostgresBatchEventGC(db *PostgresBatchDBClient, logger logr.Logger) (*PostgresBatchEventGC, error) {
+	if db == nil || db.pgCore == nil || db.pool == nil {
+		return nil, fmt.Errorf("batch database client is required for event GC")
+	}
+	return &PostgresBatchEventGC{pool: db.pool, logger: logger}, nil
+}
+
+func (g *PostgresBatchEventGC) purgeExpired(ctx context.Context) (int64, error) {
+	result, err := g.pool.Exec(ctx, ecPurgeExpiredEventsSQL)
 	if err != nil {
 		return 0, fmt.Errorf("purge expired events: %w", err)
 	}
 	return result.RowsAffected(), nil
+}
+
+// Run sweeps once on startup and then every eventSweepInterval until cancelled.
+// The caller owns the batch database pool and must keep it open until Run exits.
+func (g *PostgresBatchEventGC) Run(ctx context.Context) error {
+	sweep := func() {
+		purged, err := g.purgeExpired(ctx)
+		if err != nil {
+			if ctx.Err() == nil {
+				g.logger.Error(err, "event GC: purge failed")
+			}
+		} else if purged > 0 {
+			g.logger.Info("event GC: purged expired events", "purged", purged)
+		}
+	}
+	if ctx.Err() != nil {
+		return nil
+	}
+	sweep()
+	ticker := time.NewTicker(eventSweepInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			sweep()
+		}
+	}
+}
+
+// NewPostgresBatchEventProducer creates an event client for the API server
+// without a listener, dispatcher, or subscribers.
+func NewPostgresBatchEventProducer(ctx context.Context, config *PostgreSQLConfig) (*PostgresBatchEventClient, error) {
+	pool, err := newEventPool(ctx, config)
+	if err != nil {
+		return nil, err
+	}
+	return &PostgresBatchEventClient{pool: pool, producerOnly: true}, nil
 }
 
 func (c *PostgresBatchEventClient) ECProducerSendEvents(ctx context.Context, events []api.BatchEvent) (sentIDs []string, err error) {
@@ -214,6 +238,9 @@ func (c *PostgresBatchEventClient) ECProducerSendEvents(ctx context.Context, eve
 }
 
 func (c *PostgresBatchEventClient) ECConsumerGetChannel(ctx context.Context, ID string) (*api.BatchEventsChan, error) {
+	if c.producerOnly {
+		return nil, fmt.Errorf("event producer does not support subscriptions")
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
