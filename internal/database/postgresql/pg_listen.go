@@ -49,6 +49,7 @@ type pgListener struct {
 
 	listenErrLogged bool
 	deferred        atomic.Int64
+	backendPID      atomic.Uint32 // active LISTEN backend; zero while disconnected
 }
 
 func newPGListener(pool *pgxpool.Pool, channel string, logger logr.Logger, onReconnect func()) *pgListener {
@@ -158,6 +159,8 @@ func (l *pgListener) listenLoop(ctx context.Context, conn *pgxpool.Conn) {
 	}
 
 	l.listenErrLogged = false
+	l.backendPID.Store(conn.Conn().PgConn().PID())
+	defer l.backendPID.Store(0)
 	l.logger.V(logging.INFO).Info("pgListener: listening", "channel", l.channel)
 
 	// Trigger proactive drain on successful connect/reconnect
