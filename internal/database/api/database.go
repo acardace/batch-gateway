@@ -225,3 +225,9 @@ type BatchEventChannelClient interface {
 	// The events are sent and consumed in FIFO order.
 	ECProducerSendEvents(ctx context.Context, events []BatchEvent) (sentIDs []string, err error)
 }
+
+// BatchEventGC removes expired events. The GC process runs the backend's
+// implementation until the context is cancelled.
+type BatchEventGC interface {
+	Run(ctx context.Context) error
+}

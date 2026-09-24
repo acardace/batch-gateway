@@ -46,6 +46,7 @@ type Clientset struct {
 	FileDB         dbapi.FileDBClient
 	Queue          dbapi.BatchPriorityQueueClient
 	Event          dbapi.BatchEventChannelClient
+	EventGC        dbapi.BatchEventGC
 	Inference      *inference.GatewayResolver
 	AsyncInference *inference.AsyncGatewayResolver
 }
@@ -92,7 +93,7 @@ func NewS3FileClient(ctx context.Context, cfg *s3client.Config) (fsapi.BatchFile
 
 // NewPostgreSQLDBClients creates PostgreSQL-backed batch and file database clients.
 // It reads the URL from the mounted secrets when not set in the config.
-func NewPostgreSQLDBClients(ctx context.Context, cfg *postgresql.PostgreSQLConfig) (dbapi.BatchProgressDBClient, dbapi.FileDBClient, error) {
+func NewPostgreSQLDBClients(ctx context.Context, cfg *postgresql.PostgreSQLConfig) (*postgresql.PostgresBatchDBClient, dbapi.FileDBClient, error) {
 	if cfg == nil {
 		return nil, nil, fmt.Errorf("postgresql config cannot be nil")
 	}
@@ -225,9 +226,22 @@ func NewClientset(ctx context.Context, component ucom.Component, opts ...Option)
 			}
 			cs.Queue = queueClient
 
-			eventClient, err := postgresql.NewPostgresBatchEventClient(ctx, &cfg.dbCfg.PostgreSQLCfg, logger)
+			var eventClient dbapi.BatchEventChannelClient
+			switch component {
+			case ucom.ComponentProcessor:
+				eventClient, err = postgresql.NewPostgresBatchEventClient(ctx, &cfg.dbCfg.PostgreSQLCfg, logger)
+			case ucom.ComponentApiserver:
+				eventClient, err = postgresql.NewPostgresBatchEventProducer(ctx, &cfg.dbCfg.PostgreSQLCfg)
+			case ucom.ComponentGC:
+				cs.EventGC, err = postgresql.NewPostgresBatchEventGC(batchDB, logger)
+				if err != nil {
+					return nil, fmt.Errorf("failed to create postgres event GC: %w", err)
+				}
+			default:
+				return nil, fmt.Errorf("unsupported component for postgres events: %s", component)
+			}
 			if err != nil {
-				return nil, fmt.Errorf("failed to create postgres event client: %w", err)
+				return nil, fmt.Errorf("failed to create postgres event client for %s: %w", component, err)
 			}
 			cs.Event = eventClient
 		default:

@@ -53,6 +53,72 @@ func TestBatchEventValidation(t *testing.T) {
 	}
 }
 
+func TestPostgresBatchEventProducer(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	producer := &PostgresBatchEventClient{pool: mock, producerOnly: true}
+	defer func() { _ = producer.Close() }()
+
+	mock.ExpectExec("INSERT INTO batch_events").
+		WithArgs("job-1", int(api.BatchEventCancel), pgxmock.AnyArg()).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	ids, err := producer.ECProducerSendEvents(context.Background(), []api.BatchEvent{{
+		ID: "job-1", Type: api.BatchEventCancel, TTL: 60,
+	}})
+	if err != nil || len(ids) != 1 || ids[0] != "job-1" {
+		t.Fatalf("ECProducerSendEvents = %v, %v", ids, err)
+	}
+	if _, err := producer.ECConsumerGetChannel(context.Background(), "job-1"); err == nil {
+		t.Fatal("producer accepted a subscription")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestPostgresBatchEventGC_PurgeExpiredEventsMock(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+	db := &PostgresBatchDBClient{pgCore: &pgCore{pool: mock}}
+	gc, err := NewPostgresBatchEventGC(db, logr.Discard())
+	if err != nil {
+		t.Fatalf("NewPostgresBatchEventGC: %v", err)
+	}
+	mock.ExpectExec("DELETE FROM batch_events(?s:.*)WHERE expires_at").
+		WillReturnResult(pgxmock.NewResult("DELETE", 2))
+	purged, err := gc.purgeExpired(context.Background())
+	if err != nil || purged != 2 {
+		t.Fatalf("purgeExpired = %d, %v; want 2, nil", purged, err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestPostgresBatchEventGC_RunPurgesOnStart(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+	gc := &PostgresBatchEventGC{pool: mock, logger: logr.Discard()}
+	mock.ExpectExec("DELETE FROM batch_events(?s:.*)WHERE expires_at").
+		WillReturnResult(pgxmock.NewResult("DELETE", 1))
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := gc.Run(ctx); err != nil {
+		t.Fatalf("event GC Run: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("event GC did not purge on start: %v", err)
+	}
+}
+
 func TestPGListener_SubscribeDeliverClose(t *testing.T) {
 	l := &pgListener{
 		channel: "batch_events",
@@ -186,21 +252,25 @@ func TestPostgresBatchEventClient_BackstopRescan(t *testing.T) {
 	}
 }
 
-// TestPostgresBatchEventClient_PurgeExpiredEvents requires a real PostgreSQL
-// instance (TEST_POSTGRES_URL) and verifies the sweeper's contract: expired,
-// never-consumed rows are deleted, unexpired rows are left alone.
-func TestPostgresBatchEventClient_PurgeExpiredEvents(t *testing.T) {
+// TestPostgresBatchEventGC_PurgeExpiredEvents requires a real PostgreSQL
+// instance (TEST_POSTGRES_URL) and verifies that expired, never-consumed
+// events are deleted while live events remain.
+func TestPostgresBatchEventGC_PurgeExpiredEvents(t *testing.T) {
 	url := os.Getenv("TEST_POSTGRES_URL")
 	if url == "" {
 		t.Skip("TEST_POSTGRES_URL not set")
 	}
 	ctx := context.Background()
 
-	client, err := NewPostgresBatchEventClient(ctx, &PostgreSQLConfig{Url: url}, logr.Discard())
+	client, err := NewPostgresBatchDBClient(ctx, &PostgreSQLConfig{Url: url})
 	if err != nil {
-		t.Fatalf("NewPostgresBatchEventClient: %v", err)
+		t.Fatalf("NewPostgresBatchDBClient: %v", err)
 	}
 	defer func() { _ = client.Close() }()
+	eventGC, err := NewPostgresBatchEventGC(client, logr.Discard())
+	if err != nil {
+		t.Fatalf("NewPostgresBatchEventGC: %v", err)
+	}
 
 	pool, err := pgxpool.New(ctx, url)
 	if err != nil {
@@ -222,12 +292,12 @@ func TestPostgresBatchEventClient_PurgeExpiredEvents(t *testing.T) {
 		_, _ = pool.Exec(ctx, `DELETE FROM batch_events WHERE job_id IN ($1, $2)`, expiredJob, liveJob)
 	}()
 
-	purged, err := client.purgeExpiredEvents(ctx)
+	purged, err := eventGC.purgeExpired(ctx)
 	if err != nil {
-		t.Fatalf("purgeExpiredEvents: %v", err)
+		t.Fatalf("purgeExpired: %v", err)
 	}
 	if purged < 1 {
-		t.Fatalf("purgeExpiredEvents purged %d rows, want >= 1 (the expired test row)", purged)
+		t.Fatalf("purgeExpired purged %d rows, want >= 1 (the expired test row)", purged)
 	}
 
 	var remaining int
