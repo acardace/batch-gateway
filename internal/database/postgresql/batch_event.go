@@ -51,14 +51,18 @@ const ecSendEventSQL = `WITH ins AS (
 )
 SELECT pg_notify('` + channelEvents + `', (SELECT job_id FROM ins))`
 
-const ecDrainEventsSQL = `DELETE FROM batch_events
-WHERE id IN (
+const ecDrainEventsSQL = `WITH selected AS (
 	SELECT id FROM batch_events
 	WHERE job_id = $1 AND expires_at > EXTRACT(EPOCH FROM NOW())::BIGINT
 	ORDER BY id
 	FOR UPDATE SKIP LOCKED
+), deleted AS (
+	DELETE FROM batch_events AS events
+	USING selected
+	WHERE events.id = selected.id
+	RETURNING events.id, events.event_type
 )
-RETURNING event_type`
+SELECT event_type FROM deleted ORDER BY id`
 
 // ecPurgeExpiredEventsSQL deletes events that are past their TTL and were
 // never consumed. The drain above only removes unexpired rows, so without

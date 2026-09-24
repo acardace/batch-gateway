@@ -322,3 +322,43 @@ func TestPostgresBatchEventClient_LateAttach(t *testing.T) {
 		t.Fatal("late-attach drain did not deliver the pre-existing event within 5s")
 	}
 }
+
+// TestPostgresBatchEventClient_FIFO verifies the drain requests rows in ID
+// order and delivers the returned events in that order.
+func TestPostgresBatchEventClient_FIFO(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+	client := &PostgresBatchEventClient{
+		pool:      mock,
+		logger:    logr.Discard(),
+		eventSubs: make(map[string]*eventSub),
+	}
+	const jobID = "job-fifo"
+	want := []api.BatchEventType{api.BatchEventCancel, api.BatchEventPause, api.BatchEventResume}
+	mock.ExpectQuery(`SELECT event_type FROM deleted ORDER BY id`).
+		WithArgs(jobID).
+		WillReturnRows(pgxmock.NewRows([]string{"event_type"}).
+			AddRow(int(want[0])).AddRow(int(want[1])).AddRow(int(want[2])))
+
+	ch, err := client.ECConsumerGetChannel(context.Background(), jobID)
+	if err != nil {
+		t.Fatalf("ECConsumerGetChannel: %v", err)
+	}
+	defer ch.CloseFn()
+	for i, expected := range want {
+		select {
+		case event := <-ch.Events:
+			if event.Type != expected {
+				t.Fatalf("event %d type = %d, want %d", i, event.Type, expected)
+			}
+		default:
+			t.Fatalf("event %d not delivered", i)
+		}
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
