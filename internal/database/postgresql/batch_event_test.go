@@ -18,6 +18,7 @@ package postgresql
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"sync"
 	"testing"
@@ -26,7 +27,7 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/pashagolub/pgxmock/v4"
+	"github.com/pashagolub/pgxmock/v5"
 
 	"github.com/llm-d/llm-d-batch-gateway/internal/database/api"
 )
@@ -256,10 +257,7 @@ func TestPostgresBatchEventClient_BackstopRescan(t *testing.T) {
 // instance (TEST_POSTGRES_URL) and verifies that expired, never-consumed
 // events are deleted while live events remain.
 func TestPostgresBatchEventGC_PurgeExpiredEvents(t *testing.T) {
-	url := os.Getenv("TEST_POSTGRES_URL")
-	if url == "" {
-		t.Skip("TEST_POSTGRES_URL not set")
-	}
+	url := requirePostgresURL(t)
 	ctx := context.Background()
 
 	client, err := NewPostgresBatchDBClient(ctx, &PostgreSQLConfig{Url: url})
@@ -330,15 +328,21 @@ func newTestEventClientForURL(t *testing.T, url string) *PostgresBatchEventClien
 	return client
 }
 
+func requirePostgresURL(t *testing.T) string {
+	t.Helper()
+	url := os.Getenv("TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("TEST_POSTGRES_URL not set")
+	}
+	return url
+}
+
 // TestPostgresBatchEventClient_RoundTrip requires a real PostgreSQL instance
 // (TEST_POSTGRES_URL) and verifies the full path: a produced event is drained
 // from the table and delivered to a live subscriber. The 35s window covers the
 // NOTIFY fast path (sub-second) and the 30s backstop rescan.
 func TestPostgresBatchEventClient_RoundTrip(t *testing.T) {
-	url := os.Getenv("TEST_POSTGRES_URL")
-	if url == "" {
-		t.Skip("TEST_POSTGRES_URL not set")
-	}
+	url := requirePostgresURL(t)
 	const jobID = "round-trip-job"
 	client := newTestEventClientForURL(t, url)
 
@@ -369,10 +373,7 @@ func TestPostgresBatchEventClient_RoundTrip(t *testing.T) {
 // before any subscriber exists is still delivered when a subscriber attaches
 // later (the proactive drain picks the row up from the table).
 func TestPostgresBatchEventClient_LateAttach(t *testing.T) {
-	url := os.Getenv("TEST_POSTGRES_URL")
-	if url == "" {
-		t.Skip("TEST_POSTGRES_URL not set")
-	}
+	url := requirePostgresURL(t)
 	const jobID = "late-attach-job"
 	client := newTestEventClientForURL(t, url)
 
@@ -537,5 +538,149 @@ func TestPostgresBatchEventClient_ReplacedSubscriberKeepsEvent(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestPostgresBatchEventClient_FIFORealPG(t *testing.T) {
+	url := requirePostgresURL(t)
+	ctx := context.Background()
+	client := newTestEventClientForURL(t, url)
+	pool, err := pgxpool.New(ctx, url)
+	if err != nil {
+		t.Fatalf("pgxpool: %v", err)
+	}
+	defer pool.Close()
+	jobID := fmt.Sprintf("fifo-%d", time.Now().UnixNano())
+	defer func() { _, _ = pool.Exec(ctx, `DELETE FROM batch_events WHERE job_id = $1`, jobID) }()
+
+	var ids [3]int64
+	if err := pool.QueryRow(ctx, `SELECT nextval('batch_events_id_seq'), nextval('batch_events_id_seq'), nextval('batch_events_id_seq')`).
+		Scan(&ids[0], &ids[1], &ids[2]); err != nil {
+		t.Fatalf("reserve event IDs: %v", err)
+	}
+	want := []api.BatchEventType{api.BatchEventCancel, api.BatchEventPause, api.BatchEventResume}
+	// Make heap order the reverse of ID order to catch reliance on scan order.
+	for i := len(ids) - 1; i >= 0; i-- {
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO batch_events (id, job_id, event_type, expires_at) VALUES ($1, $2, $3, $4)`,
+			ids[i], jobID, int(want[i]), time.Now().Unix()+300); err != nil {
+			t.Fatalf("insert event %d: %v", i, err)
+		}
+	}
+
+	ch, err := client.ECConsumerGetChannel(ctx, jobID)
+	if err != nil {
+		t.Fatalf("ECConsumerGetChannel: %v", err)
+	}
+	defer ch.CloseFn()
+	for i, expected := range want {
+		select {
+		case event := <-ch.Events:
+			if event.Type != expected {
+				t.Fatalf("event %d type = %d, want %d", i, event.Type, expected)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for event %d", i)
+		}
+	}
+}
+
+func TestPostgresBatchEventClient_FullChannelRealPG(t *testing.T) {
+	url := requirePostgresURL(t)
+	ctx := context.Background()
+	client := newTestEventClientForURL(t, url)
+	pool, err := pgxpool.New(ctx, url)
+	if err != nil {
+		t.Fatalf("pgxpool: %v", err)
+	}
+	defer pool.Close()
+	jobID := fmt.Sprintf("full-%d", time.Now().UnixNano())
+	defer func() { _, _ = pool.Exec(ctx, `DELETE FROM batch_events WHERE job_id = $1`, jobID) }()
+
+	ch, err := client.ECConsumerGetChannel(ctx, jobID)
+	if err != nil {
+		t.Fatalf("ECConsumerGetChannel: %v", err)
+	}
+	defer ch.CloseFn()
+	for range cap(ch.Events) {
+		ch.Events <- api.BatchEvent{ID: jobID, Type: api.BatchEventPause}
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO batch_events (job_id, event_type, expires_at) VALUES ($1, $2, $3)`,
+		jobID, int(api.BatchEventCancel), time.Now().Unix()+300); err != nil {
+		t.Fatalf("insert event: %v", err)
+	}
+	client.deliverJobEvents(ctx, jobID)
+	var remaining int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM batch_events WHERE job_id = $1`, jobID).Scan(&remaining); err != nil {
+		t.Fatalf("count pending events: %v", err)
+	}
+	if remaining != 1 {
+		t.Fatalf("pending events with full channel = %d, want 1", remaining)
+	}
+	<-ch.Events // Make room for the pending event.
+	client.deliverJobEvents(ctx, jobID)
+	for range cap(ch.Events) - 1 {
+		<-ch.Events
+	}
+	if event := <-ch.Events; event.Type != api.BatchEventCancel {
+		t.Fatalf("delivered event = %+v, want cancel", event)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM batch_events WHERE job_id = $1`, jobID).Scan(&remaining); err != nil {
+		t.Fatalf("count acknowledged events: %v", err)
+	}
+	if remaining != 0 {
+		t.Fatalf("pending events after delivery = %d, want 0", remaining)
+	}
+}
+
+func waitForListenerPID(t *testing.T, listener *pgListener, previous uint32) uint32 {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if pid := listener.backendPID.Load(); pid != 0 && pid != previous {
+			return pid
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("LISTEN backend did not reconnect after PID %d", previous)
+	return 0
+}
+
+func TestPostgresBatchEventClient_ReconnectRealPG(t *testing.T) {
+	url := requirePostgresURL(t)
+	ctx := context.Background()
+	client := newTestEventClientForURL(t, url)
+	pool, err := pgxpool.New(ctx, url)
+	if err != nil {
+		t.Fatalf("pgxpool: %v", err)
+	}
+	defer pool.Close()
+	jobID := fmt.Sprintf("reconnect-%d", time.Now().UnixNano())
+	defer func() { _, _ = pool.Exec(ctx, `DELETE FROM batch_events WHERE job_id = $1`, jobID) }()
+	ch, err := client.ECConsumerGetChannel(ctx, jobID)
+	if err != nil {
+		t.Fatalf("ECConsumerGetChannel: %v", err)
+	}
+	defer ch.CloseFn()
+	oldPID := waitForListenerPID(t, client.listener, 0)
+	var terminated bool
+	if err := pool.QueryRow(ctx, `SELECT pg_terminate_backend($1)`, int(oldPID)).Scan(&terminated); err != nil || !terminated {
+		t.Fatalf("terminate LISTEN backend %d: terminated=%t err=%v", oldPID, terminated, err)
+	}
+	newPID := waitForListenerPID(t, client.listener, oldPID)
+	if newPID == oldPID {
+		t.Fatal("listener reused terminated backend")
+	}
+	if _, err := client.ECProducerSendEvents(ctx, []api.BatchEvent{{ID: jobID, Type: api.BatchEventCancel, TTL: 300}}); err != nil {
+		t.Fatalf("ECProducerSendEvents after reconnect: %v", err)
+	}
+	select {
+	case event := <-ch.Events:
+		if event.ID != jobID || event.Type != api.BatchEventCancel {
+			t.Fatalf("event after reconnect = %+v", event)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancel event was not delivered after listener reconnected")
 	}
 }
