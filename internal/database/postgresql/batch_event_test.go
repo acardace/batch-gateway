@@ -19,10 +19,12 @@ package postgresql
 import (
 	"context"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/go-logr/logr"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pashagolub/pgxmock/v4"
 
@@ -137,18 +139,11 @@ func TestPostgresBatchEventClient_BackstopRescan(t *testing.T) {
 		rescanInterval: 50 * time.Millisecond,
 	}
 
-	dispCtx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() {
-		// No wake channel traffic: only the rescan tick can deliver.
-		c.runEventDispatcher(dispCtx, make(chan string, 1), func() {})
-	}()
-
 	const jobID = "job-rescan"
 	// Proactive drain at subscription time: nothing in the table yet.
-	mock.ExpectQuery("DELETE FROM batch_events").
-		WithArgs(jobID).
-		WillReturnRows(pgxmock.NewRows([]string{"event_type"}))
+	mock.ExpectQuery("SELECT id, event_type FROM batch_events").
+		WithArgs(jobID, eventChanBufSize).
+		WillReturnRows(pgxmock.NewRows([]string{"id", "event_type"}))
 
 	events, err := c.ECConsumerGetChannel(context.Background(), jobID)
 	if err != nil {
@@ -156,12 +151,23 @@ func TestPostgresBatchEventClient_BackstopRescan(t *testing.T) {
 	}
 	defer events.CloseFn()
 
-	// Let in-flight ticks settle, then put the event "in the table": the next
-	// drain (which can only be a rescan tick by now) returns it.
-	time.Sleep(60 * time.Millisecond)
-	mock.ExpectQuery("DELETE FROM batch_events").
-		WithArgs(jobID).
-		WillReturnRows(pgxmock.NewRows([]string{"event_type"}).AddRow(int(api.BatchEventCancel)))
+	// Install all expectations before starting the dispatcher: pgxmock is not
+	// safe to configure concurrently with a running query.
+	mock.ExpectQuery("SELECT id, event_type FROM batch_events").
+		WithArgs(jobID, eventChanBufSize).
+		WillReturnRows(pgxmock.NewRows([]string{"id", "event_type"}).AddRow(int64(1), int(api.BatchEventCancel)))
+	mock.ExpectExec("DELETE FROM batch_events WHERE job_id").
+		WithArgs(jobID, []int64{1}).
+		WillReturnResult(pgxmock.NewResult("DELETE", 1))
+	dispCtx, cancel := context.WithCancel(context.Background())
+	go func() {
+		// No wake channel traffic: only the rescan tick can deliver.
+		c.runEventDispatcher(dispCtx, make(chan string, 1), func() {})
+	}()
+	defer func() {
+		cancel()
+		<-c.eventsDone
+	}()
 
 	select {
 	case ev := <-events.Events:
@@ -338,10 +344,13 @@ func TestPostgresBatchEventClient_FIFO(t *testing.T) {
 	}
 	const jobID = "job-fifo"
 	want := []api.BatchEventType{api.BatchEventCancel, api.BatchEventPause, api.BatchEventResume}
-	mock.ExpectQuery(`SELECT event_type FROM deleted ORDER BY id`).
-		WithArgs(jobID).
-		WillReturnRows(pgxmock.NewRows([]string{"event_type"}).
-			AddRow(int(want[0])).AddRow(int(want[1])).AddRow(int(want[2])))
+	mock.ExpectQuery(`SELECT id, event_type FROM batch_events(?s:.*)ORDER BY id LIMIT \$2`).
+		WithArgs(jobID, eventChanBufSize).
+		WillReturnRows(pgxmock.NewRows([]string{"id", "event_type"}).
+			AddRow(int64(1), int(want[0])).AddRow(int64(2), int(want[1])).AddRow(int64(3), int(want[2])))
+	mock.ExpectExec("DELETE FROM batch_events WHERE job_id").
+		WithArgs(jobID, []int64{1, 2, 3}).
+		WillReturnResult(pgxmock.NewResult("DELETE", 3))
 
 	ch, err := client.ECConsumerGetChannel(context.Background(), jobID)
 	if err != nil {
@@ -357,6 +366,104 @@ func TestPostgresBatchEventClient_FIFO(t *testing.T) {
 		default:
 			t.Fatalf("event %d not delivered", i)
 		}
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestPostgresBatchEventClient_FullChannelKeepsEvent(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+	const jobID = "job-full"
+	sub := &eventSub{ch: make(chan api.BatchEvent, 1)}
+	client := &PostgresBatchEventClient{
+		pool: mock, logger: logr.Discard(), eventSubs: map[string]*eventSub{jobID: sub},
+	}
+	sub.ch <- api.BatchEvent{ID: jobID, Type: api.BatchEventPause}
+
+	// A full channel must not query or remove durable events.
+	client.deliverJobEvents(context.Background(), jobID)
+	<-sub.ch
+	mock.ExpectQuery("SELECT id, event_type FROM batch_events").
+		WithArgs(jobID, 1).
+		WillReturnRows(pgxmock.NewRows([]string{"id", "event_type"}).AddRow(int64(7), int(api.BatchEventCancel)))
+	mock.ExpectExec("DELETE FROM batch_events WHERE job_id").
+		WithArgs(jobID, []int64{7}).
+		WillReturnResult(pgxmock.NewResult("DELETE", 1))
+
+	client.deliverJobEvents(context.Background(), jobID)
+	if event := <-sub.ch; event.Type != api.BatchEventCancel {
+		t.Fatalf("delivered event = %+v, want cancel", event)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+type blockingEventPool struct {
+	pgxPool
+	once    sync.Once
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (p *blockingEventPool) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	p.once.Do(func() {
+		close(p.entered)
+		select {
+		case <-p.release:
+		case <-ctx.Done():
+		}
+	})
+	return p.pgxPool.Query(ctx, sql, args...)
+}
+
+func TestPostgresBatchEventClient_ReplacedSubscriberKeepsEvent(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+	pool := &blockingEventPool{pgxPool: mock, entered: make(chan struct{}), release: make(chan struct{})}
+	const jobID = "job-replaced"
+	oldSub := &eventSub{ch: make(chan api.BatchEvent, 1)}
+	newSub := &eventSub{ch: make(chan api.BatchEvent, 1)}
+	client := &PostgresBatchEventClient{
+		pool: pool, logger: logr.Discard(), eventSubs: map[string]*eventSub{jobID: oldSub},
+	}
+	mock.ExpectQuery("SELECT id, event_type FROM batch_events").
+		WithArgs(jobID, 1).
+		WillReturnRows(pgxmock.NewRows([]string{"id", "event_type"}).AddRow(int64(8), int(api.BatchEventCancel)))
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		client.deliverJobEvents(context.Background(), jobID)
+	}()
+	<-pool.entered
+	client.eventsMu.Lock()
+	client.eventSubs[jobID] = newSub
+	client.eventsMu.Unlock()
+	close(pool.release)
+	<-done
+	if len(oldSub.ch) != 0 {
+		t.Fatal("event delivered to replaced subscriber")
+	}
+
+	// The next subscriber can still read the event because it was not acknowledged.
+	mock.ExpectQuery("SELECT id, event_type FROM batch_events").
+		WithArgs(jobID, 1).
+		WillReturnRows(pgxmock.NewRows([]string{"id", "event_type"}).AddRow(int64(8), int(api.BatchEventCancel)))
+	mock.ExpectExec("DELETE FROM batch_events WHERE job_id").
+		WithArgs(jobID, []int64{8}).
+		WillReturnResult(pgxmock.NewResult("DELETE", 1))
+	client.deliverJobEvents(context.Background(), jobID)
+	if event := <-newSub.ch; event.Type != api.BatchEventCancel {
+		t.Fatalf("delivered event = %+v, want cancel", event)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet expectations: %v", err)
