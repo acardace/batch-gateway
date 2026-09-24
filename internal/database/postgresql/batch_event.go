@@ -51,18 +51,11 @@ const ecSendEventSQL = `WITH ins AS (
 )
 SELECT pg_notify('` + channelEvents + `', (SELECT job_id FROM ins))`
 
-const ecDrainEventsSQL = `WITH selected AS (
-	SELECT id FROM batch_events
-	WHERE job_id = $1 AND expires_at > EXTRACT(EPOCH FROM NOW())::BIGINT
-	ORDER BY id
-	FOR UPDATE SKIP LOCKED
-), deleted AS (
-	DELETE FROM batch_events AS events
-	USING selected
-	WHERE events.id = selected.id
-	RETURNING events.id, events.event_type
-)
-SELECT event_type FROM deleted ORDER BY id`
+const ecDrainEventsSQL = `SELECT id, event_type FROM batch_events
+WHERE job_id = $1 AND expires_at > EXTRACT(EPOCH FROM NOW())::BIGINT
+ORDER BY id LIMIT $2`
+
+const ecAckEventsSQL = `DELETE FROM batch_events WHERE job_id = $1 AND id = ANY($2)`
 
 // ecPurgeExpiredEventsSQL deletes events that are past their TTL and were
 // never consumed. The drain above only removes unexpired rows, so without
@@ -72,8 +65,9 @@ const ecPurgeExpiredEventsSQL = `DELETE FROM batch_events
 WHERE expires_at < EXTRACT(EPOCH FROM NOW())::BIGINT`
 
 type eventSub struct {
-	ch        chan api.BatchEvent
-	closeOnce sync.Once
+	ch         chan api.BatchEvent
+	closeOnce  sync.Once
+	deliveryMu sync.Mutex
 }
 
 // PostgresBatchEventClient implements api.BatchEventChannelClient using PostgreSQL.
@@ -332,8 +326,21 @@ func (c *PostgresBatchEventClient) deliverJobEvents(ctx context.Context, jobID s
 	if !ok {
 		return
 	}
+	sub.deliveryMu.Lock()
+	defer sub.deliveryMu.Unlock()
 
-	events, err := c.drainJobEvents(ctx, jobID)
+	c.eventsMu.Lock()
+	if c.eventSubs[jobID] != sub {
+		c.eventsMu.Unlock()
+		return
+	}
+	capacity := cap(sub.ch) - len(sub.ch)
+	c.eventsMu.Unlock()
+	if capacity == 0 {
+		return
+	}
+
+	events, err := c.drainJobEvents(ctx, jobID, capacity)
 	if err != nil {
 		c.logger.Error(err, "event dispatcher: drain failed", "ID", jobID)
 		return
@@ -343,36 +350,55 @@ func (c *PostgresBatchEventClient) deliverJobEvents(ctx context.Context, jobID s
 	}
 
 	c.eventsMu.Lock()
-	defer c.eventsMu.Unlock()
 	if cur, present := c.eventSubs[jobID]; !present || cur != sub {
-		// The subscriber closed between the drain and the delivery check. The
-		// rows are already deleted; log so the discard is visible.
-		c.logger.V(logging.INFO).Info("event dispatcher: subscriber gone before delivery, discarding drained events", "ID", jobID, "n", len(events))
+		c.eventsMu.Unlock()
+		// The rows remain available for the next subscriber or rescan.
 		return
 	}
+	accepted := make([]int64, 0, len(events))
+deliveryLoop:
 	for _, event := range events {
 		select {
-		case sub.ch <- event:
+		case sub.ch <- api.BatchEvent{ID: jobID, Type: event.eventType}:
+			accepted = append(accepted, event.id)
 		default:
-			c.logger.Error(errEventChannelFull, "event dispatcher: dropping event", "ID", jobID, "type", event.Type)
+			c.logger.Error(errEventChannelFull, "event dispatcher: channel full, deferring event", "ID", jobID, "type", event.eventType)
+			// Do not deliver later events ahead of this one.
+			break deliveryLoop
+		}
+	}
+	c.eventsMu.Unlock()
+
+	// Selection and acknowledgement are separate from channel delivery, so a
+	// failed acknowledgement (or concurrent consumer) may redeliver an event.
+	// Only events enqueued to this subscriber may be removed from the table.
+	if len(accepted) > 0 {
+		if _, err := c.pool.Exec(ctx, ecAckEventsSQL, jobID, accepted); err != nil {
+			c.logger.Error(err, "event dispatcher: acknowledge failed; events may be redelivered", "ID", jobID)
 		}
 	}
 }
 
-func (c *PostgresBatchEventClient) drainJobEvents(ctx context.Context, jobID string) ([]api.BatchEvent, error) {
-	rows, err := c.pool.Query(ctx, ecDrainEventsSQL, jobID)
+type pendingBatchEvent struct {
+	id        int64
+	eventType api.BatchEventType
+}
+
+func (c *PostgresBatchEventClient) drainJobEvents(ctx context.Context, jobID string, limit int) ([]pendingBatchEvent, error) {
+	rows, err := c.pool.Query(ctx, ecDrainEventsSQL, jobID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("drain events: %w", err)
 	}
 	defer rows.Close()
 
-	var events []api.BatchEvent
+	var events []pendingBatchEvent
 	for rows.Next() {
+		var id int64
 		var eventType int
-		if err := rows.Scan(&eventType); err != nil {
+		if err := rows.Scan(&id, &eventType); err != nil {
 			return nil, fmt.Errorf("drain events scan: %w", err)
 		}
-		events = append(events, api.BatchEvent{ID: jobID, Type: api.BatchEventType(eventType)})
+		events = append(events, pendingBatchEvent{id: id, eventType: api.BatchEventType(eventType)})
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("drain events rows: %w", err)
