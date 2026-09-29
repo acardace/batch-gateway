@@ -41,14 +41,15 @@ import (
 
 // Clientset holds all clients.
 type Clientset struct {
-	File           fsapi.BatchFilesClient
-	BatchDB        dbapi.BatchProgressDBClient
-	FileDB         dbapi.FileDBClient
-	Queue          dbapi.BatchPriorityQueueClient
-	Event          dbapi.BatchEventChannelClient
-	EventGC        dbapi.BatchEventGC
-	Inference      *inference.GatewayResolver
-	AsyncInference *inference.AsyncGatewayResolver
+	File            fsapi.BatchFilesClient
+	BatchDB         dbapi.BatchDBClient
+	BatchProgressDB dbapi.BatchProgressDBClient
+	FileDB          dbapi.FileDBClient
+	Queue           dbapi.BatchPriorityQueueClient
+	Event           dbapi.BatchEventChannelClient
+	EventGC         dbapi.BatchEventGC
+	Inference       *inference.GatewayResolver
+	AsyncInference  *inference.AsyncGatewayResolver
 }
 
 // NewFSFileClient creates a filesystem-based file storage client.
@@ -215,6 +216,7 @@ func NewClientset(ctx context.Context, component ucom.Component, opts ...Option)
 
 			var processorID string
 			if component == ucom.ComponentProcessor {
+				cs.BatchProgressDB = batchDB
 				processorID, err = os.Hostname()
 				if err != nil {
 					return nil, fmt.Errorf("failed to get hostname for processor ID: %w", err)

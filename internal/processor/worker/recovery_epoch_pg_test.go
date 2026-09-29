@@ -50,12 +50,13 @@ func TestRecoverOwnedJobsFencesPreviousEpoch(t *testing.T) {
 	pcfg := config.NewConfig()
 	pcfg.WorkDir = t.TempDir()
 	p, err := NewProcessor(pcfg, &clientset.Clientset{
-		BatchDB:   batchDB,
-		FileDB:    newMockFileDBClient(),
-		File:      mockfiles.NewMockBatchFilesClient(t.TempDir()),
-		Queue:     queue,
-		Event:     mockdb.NewMockBatchEventChannelClient(),
-		Inference: inference.NewSingleClientResolver(&fakeInferenceClient{}),
+		BatchDB:         batchDB,
+		BatchProgressDB: batchDB,
+		FileDB:          newMockFileDBClient(),
+		File:            mockfiles.NewMockBatchFilesClient(t.TempDir()),
+		Queue:           queue,
+		Event:           mockdb.NewMockBatchEventChannelClient(),
+		Inference:       inference.NewSingleClientResolver(&fakeInferenceClient{}),
 	}, processorID, testLogger(t))
 	if err != nil {
 		t.Fatalf("NewProcessor: %v", err)

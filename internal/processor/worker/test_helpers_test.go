@@ -352,6 +352,11 @@ func (f *failOnStatusDB) Close() error { return f.inner.Close() }
 
 func mustNewProcessor(t *testing.T, cfg *config.ProcessorConfig, clients *clientset.Clientset) *Processor {
 	t.Helper()
+	if clients.BatchProgressDB == nil {
+		if batchDB, ok := clients.BatchDB.(db.BatchProgressDBClient); ok {
+			clients.BatchProgressDB = batchDB
+		}
+	}
 	p, err := NewProcessor(cfg, clients, "test-processor", testLogger(t))
 	if err != nil {
 		t.Fatalf("NewProcessor: %v", err)
@@ -373,13 +378,15 @@ func mustNewProcessor(t *testing.T, cfg *config.ProcessorConfig, clients *client
 
 func validProcessorClients(t testing.TB) *clientset.Clientset {
 	t.Helper()
+	batchDB := newMockBatchDBClient()
 	return &clientset.Clientset{
-		BatchDB:   newMockBatchDBClient(),
-		FileDB:    newMockFileDBClient(),
-		File:      mockfiles.NewMockBatchFilesClient(t.TempDir()),
-		Queue:     mockdb.NewMockBatchPriorityQueueClient(),
-		Event:     mockdb.NewMockBatchEventChannelClient(),
-		Inference: inference.NewSingleClientResolver(&fakeInferenceClient{}),
+		BatchDB:         batchDB,
+		BatchProgressDB: batchDB,
+		FileDB:          newMockFileDBClient(),
+		File:            mockfiles.NewMockBatchFilesClient(t.TempDir()),
+		Queue:           mockdb.NewMockBatchPriorityQueueClient(),
+		Event:           mockdb.NewMockBatchEventChannelClient(),
+		Inference:       inference.NewSingleClientResolver(&fakeInferenceClient{}),
 	}
 }
 
@@ -400,12 +407,13 @@ func newTestProcessorEnv(t *testing.T, cfg *config.ProcessorConfig, inferClient 
 	pqClient := mockdb.NewMockBatchPriorityQueueClient()
 
 	p, err := NewProcessor(cfg, &clientset.Clientset{
-		BatchDB:   dbClient,
-		FileDB:    newMockFileDBClient(),
-		File:      mockfiles.NewMockBatchFilesClient(t.TempDir()),
-		Queue:     pqClient,
-		Event:     mockdb.NewMockBatchEventChannelClient(),
-		Inference: inference.NewSingleClientResolver(inferClient),
+		BatchDB:         dbClient,
+		BatchProgressDB: dbClient,
+		FileDB:          newMockFileDBClient(),
+		File:            mockfiles.NewMockBatchFilesClient(t.TempDir()),
+		Queue:           pqClient,
+		Event:           mockdb.NewMockBatchEventChannelClient(),
+		Inference:       inference.NewSingleClientResolver(inferClient),
 	}, "test-processor", testLogger(t))
 	if err != nil {
 		t.Fatalf("NewProcessor: %v", err)

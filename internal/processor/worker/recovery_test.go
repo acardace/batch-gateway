@@ -32,12 +32,13 @@ func newRecoveryTestProcessor(t *testing.T, workDir string) (*Processor, db.Batc
 	cfg.WorkDir = workDir
 
 	p, err := NewProcessor(cfg, &clientset.Clientset{
-		BatchDB:   batchDB,
-		FileDB:    newMockFileDBClient(),
-		File:      mockfiles.NewMockBatchFilesClient(t.TempDir()),
-		Queue:     spyQueue,
-		Event:     mockdb.NewMockBatchEventChannelClient(),
-		Inference: inference.NewSingleClientResolver(&fakeInferenceClient{}),
+		BatchDB:         batchDB,
+		BatchProgressDB: batchDB,
+		FileDB:          newMockFileDBClient(),
+		File:            mockfiles.NewMockBatchFilesClient(t.TempDir()),
+		Queue:           spyQueue,
+		Event:           mockdb.NewMockBatchEventChannelClient(),
+		Inference:       inference.NewSingleClientResolver(&fakeInferenceClient{}),
 	}, "test-processor", testLogger(t))
 	if err != nil {
 		t.Fatalf("NewProcessor: %v", err)
@@ -176,12 +177,13 @@ func newRecoveryTestProcessorWithQueryFilter(t *testing.T, workDir string) (*Pro
 	cfg.WorkDir = workDir
 
 	p, err := NewProcessor(cfg, &clientset.Clientset{
-		BatchDB:   batchDB,
-		FileDB:    newMockFileDBClient(),
-		File:      mockfiles.NewMockBatchFilesClient(t.TempDir()),
-		Queue:     spyQueue,
-		Event:     mockdb.NewMockBatchEventChannelClient(),
-		Inference: inference.NewSingleClientResolver(&fakeInferenceClient{}),
+		BatchDB:         batchDB,
+		BatchProgressDB: batchDB,
+		FileDB:          newMockFileDBClient(),
+		File:            mockfiles.NewMockBatchFilesClient(t.TempDir()),
+		Queue:           spyQueue,
+		Event:           mockdb.NewMockBatchEventChannelClient(),
+		Inference:       inference.NewSingleClientResolver(&fakeInferenceClient{}),
 	}, "test-processor", testLogger(t))
 	if err != nil {
 		t.Fatalf("NewProcessor: %v", err)
@@ -739,12 +741,13 @@ func newRecoveryTestProcessorWithFailDB(t *testing.T, workDir string, failOn int
 	cfg.WorkDir = workDir
 
 	p, err := NewProcessor(cfg, &clientset.Clientset{
-		BatchDB:   failDB,
-		FileDB:    newMockFileDBClient(),
-		File:      mockfiles.NewMockBatchFilesClient(t.TempDir()),
-		Queue:     pq,
-		Event:     mockdb.NewMockBatchEventChannelClient(),
-		Inference: inference.NewSingleClientResolver(&fakeInferenceClient{}),
+		BatchDB:         failDB,
+		BatchProgressDB: failDB,
+		FileDB:          newMockFileDBClient(),
+		File:            mockfiles.NewMockBatchFilesClient(t.TempDir()),
+		Queue:           pq,
+		Event:           mockdb.NewMockBatchEventChannelClient(),
+		Inference:       inference.NewSingleClientResolver(&fakeInferenceClient{}),
 	}, "test-processor", testLogger(t))
 	if err != nil {
 		t.Fatalf("NewProcessor: %v", err)
@@ -776,12 +779,13 @@ func TestRecoverJob_Cancelling_AllUpdatesFail_ReturnsError(t *testing.T) {
 	cfg.WorkDir = workDir
 
 	p, err := NewProcessor(cfg, &clientset.Clientset{
-		BatchDB:   failDB,
-		FileDB:    newMockFileDBClient(),
-		File:      mockfiles.NewMockBatchFilesClient(t.TempDir()),
-		Queue:     pq,
-		Event:     mockdb.NewMockBatchEventChannelClient(),
-		Inference: inference.NewSingleClientResolver(&fakeInferenceClient{}),
+		BatchDB:         failDB,
+		BatchProgressDB: failDB,
+		FileDB:          newMockFileDBClient(),
+		File:            mockfiles.NewMockBatchFilesClient(t.TempDir()),
+		Queue:           pq,
+		Event:           mockdb.NewMockBatchEventChannelClient(),
+		Inference:       inference.NewSingleClientResolver(&fakeInferenceClient{}),
 	}, "test-processor", testLogger(t))
 	if err != nil {
 		t.Fatalf("NewProcessor: %v", err)
@@ -818,12 +822,13 @@ func TestRecoverJob_Validating_EnqueueFails_FallsBackToFailed(t *testing.T) {
 	cfg.WorkDir = workDir
 
 	p, err := NewProcessor(cfg, &clientset.Clientset{
-		BatchDB:   batchDB,
-		FileDB:    newMockFileDBClient(),
-		File:      mockfiles.NewMockBatchFilesClient(t.TempDir()),
-		Queue:     pq,
-		Event:     mockdb.NewMockBatchEventChannelClient(),
-		Inference: inference.NewSingleClientResolver(&fakeInferenceClient{}),
+		BatchDB:         batchDB,
+		BatchProgressDB: batchDB,
+		FileDB:          newMockFileDBClient(),
+		File:            mockfiles.NewMockBatchFilesClient(t.TempDir()),
+		Queue:           pq,
+		Event:           mockdb.NewMockBatchEventChannelClient(),
+		Inference:       inference.NewSingleClientResolver(&fakeInferenceClient{}),
 	}, "test-processor", testLogger(t))
 	if err != nil {
 		t.Fatalf("NewProcessor: %v", err)
@@ -864,12 +869,13 @@ func TestRecoverJob_InProgressReEnqueue_EnqueueFails_FallsBackToFailed(t *testin
 	cfg.WorkDir = workDir
 
 	p, err := NewProcessor(cfg, &clientset.Clientset{
-		BatchDB:   batchDB,
-		FileDB:    newMockFileDBClient(),
-		File:      mockfiles.NewMockBatchFilesClient(t.TempDir()),
-		Queue:     pq,
-		Event:     mockdb.NewMockBatchEventChannelClient(),
-		Inference: inference.NewSingleClientResolver(&fakeInferenceClient{}),
+		BatchDB:         batchDB,
+		BatchProgressDB: batchDB,
+		FileDB:          newMockFileDBClient(),
+		File:            mockfiles.NewMockBatchFilesClient(t.TempDir()),
+		Queue:           pq,
+		Event:           mockdb.NewMockBatchEventChannelClient(),
+		Inference:       inference.NewSingleClientResolver(&fakeInferenceClient{}),
 	}, "test-processor", testLogger(t))
 	if err != nil {
 		t.Fatalf("NewProcessor: %v", err)
@@ -998,12 +1004,13 @@ func TestRecoverOwnedJobs_RunsConcurrently(t *testing.T) {
 	cfg.Concurrency.Recovery = 5
 
 	p, err := NewProcessor(cfg, &clientset.Clientset{
-		BatchDB:   slowDB,
-		FileDB:    newMockFileDBClient(),
-		File:      mockfiles.NewMockBatchFilesClient(t.TempDir()),
-		Queue:     pq,
-		Event:     mockdb.NewMockBatchEventChannelClient(),
-		Inference: inference.NewSingleClientResolver(&fakeInferenceClient{}),
+		BatchDB:         slowDB,
+		BatchProgressDB: slowDB,
+		FileDB:          newMockFileDBClient(),
+		File:            mockfiles.NewMockBatchFilesClient(t.TempDir()),
+		Queue:           pq,
+		Event:           mockdb.NewMockBatchEventChannelClient(),
+		Inference:       inference.NewSingleClientResolver(&fakeInferenceClient{}),
 	}, "test-processor", testLogger(t))
 	if err != nil {
 		t.Fatalf("NewProcessor: %v", err)
@@ -1176,12 +1183,13 @@ func TestRecoverJob_ExpiredWriteFails_FallbackToFailed(t *testing.T) {
 	cfg.WorkDir = workDir
 
 	p, err := NewProcessor(cfg, &clientset.Clientset{
-		BatchDB:   failDB,
-		FileDB:    newMockFileDBClient(),
-		File:      mockfiles.NewMockBatchFilesClient(t.TempDir()),
-		Queue:     pq,
-		Event:     mockdb.NewMockBatchEventChannelClient(),
-		Inference: inference.NewSingleClientResolver(&fakeInferenceClient{}),
+		BatchDB:         failDB,
+		BatchProgressDB: failDB,
+		FileDB:          newMockFileDBClient(),
+		File:            mockfiles.NewMockBatchFilesClient(t.TempDir()),
+		Queue:           pq,
+		Event:           mockdb.NewMockBatchEventChannelClient(),
+		Inference:       inference.NewSingleClientResolver(&fakeInferenceClient{}),
 	}, "test-processor", testLogger(t))
 	if err != nil {
 		t.Fatalf("NewProcessor: %v", err)
