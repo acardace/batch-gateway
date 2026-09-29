@@ -61,11 +61,11 @@ func (s *StatusUpdater) UpdateProgressCounts(
 		return fmt.Errorf("requestCounts is nil")
 	}
 
-	return s.db.DBUpdateProgress(ctx, jobID, epoch, db.BatchRequestCounts{
-		Total:     requestCounts.Total,
-		Completed: requestCounts.Completed,
-		Failed:    requestCounts.Failed,
-	})
+	countsJSON, err := json.Marshal(requestCounts)
+	if err != nil {
+		return fmt.Errorf("marshal request counts: %w", err)
+	}
+	return s.db.DBUpdateProgress(ctx, jobID, epoch, countsJSON)
 }
 
 // UpdatePersistentStatus writes the job status to the persistent database (e.g. PostgreSQL).

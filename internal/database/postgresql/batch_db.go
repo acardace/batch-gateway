@@ -19,7 +19,6 @@ package postgresql
 import (
 	"context"
 	_ "embed"
-	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -189,13 +188,9 @@ func (c *PostgresBatchDBClient) DBDelete(ctx context.Context, ids []string) (del
 // column, fenced by the batch's current epoch: a stale-epoch writer (a
 // fenced-out processor incarnation) must not overwrite the current owner's
 // counts, so a mismatched epoch matches no rows and is silently discarded.
-func (c *PostgresBatchDBClient) DBUpdateProgress(ctx context.Context, id string, epoch int64, counts api.BatchRequestCounts) error {
+func (c *PostgresBatchDBClient) DBUpdateProgress(ctx context.Context, id string, epoch int64, countsJSON []byte) error {
 	if id == "" {
 		return fmt.Errorf("DBUpdateProgress: empty ID")
-	}
-	countsJSON, err := json.Marshal(counts)
-	if err != nil {
-		return fmt.Errorf("DBUpdateProgress: marshal counts: %w", err)
 	}
 
 	sql := fmt.Sprintf(

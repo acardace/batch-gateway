@@ -173,7 +173,7 @@ func (m *MockDBClient[T, Q]) DBDelete(ctx context.Context, ids []string) (delete
 	return
 }
 
-func (m *MockDBClient[T, Q]) DBUpdateProgress(ctx context.Context, id string, epoch int64, counts api.BatchRequestCounts) error {
+func (m *MockDBClient[T, Q]) DBUpdateProgress(ctx context.Context, id string, epoch int64, countsJSON []byte) error {
 	if id == "" {
 		return fmt.Errorf("DBUpdateProgress: empty ID")
 	}
@@ -200,11 +200,10 @@ func (m *MockDBClient[T, Q]) DBUpdateProgress(ctx context.Context, id string, ep
 			if statusMap == nil {
 				statusMap = make(map[string]any)
 			}
-			statusMap["request_counts"] = map[string]any{
-				"total":     counts.Total,
-				"completed": counts.Completed,
-				"failed":    counts.Failed,
+			if !json.Valid(countsJSON) {
+				return fmt.Errorf("DBUpdateProgress: invalid request counts JSON")
 			}
+			statusMap["request_counts"] = json.RawMessage(countsJSON)
 			newStatus, err := json.Marshal(statusMap)
 			if err != nil {
 				return fmt.Errorf("DBUpdateProgress: marshal status: %w", err)

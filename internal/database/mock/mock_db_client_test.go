@@ -57,19 +57,25 @@ func TestMockDBClient_DBUpdateProgress_EpochFence(t *testing.T) {
 
 	// A stale-epoch write is fenced out: it surfaces ErrConflict and must not
 	// touch the row.
-	if err := dbClient.DBUpdateProgress(ctx, "job-1", 4, api.BatchRequestCounts{Total: 10, Completed: 1}); !errors.Is(err, api.ErrConflict) {
+	if err := dbClient.DBUpdateProgress(ctx, "job-1", 4, []byte(`{"total":10,"completed":1}`)); !errors.Is(err, api.ErrConflict) {
 		t.Fatalf("stale-epoch DBUpdateProgress: expected ErrConflict, got %v", err)
 	}
 	if counts := getCounts(t); counts != nil {
 		t.Fatalf("stale-epoch write must not update counts, got %v", counts)
 	}
+	if err := dbClient.DBUpdateProgress(ctx, "job-1", 5, []byte(`{invalid`)); err == nil {
+		t.Fatal("expected invalid JSON to be rejected")
+	}
+	if counts := getCounts(t); counts != nil {
+		t.Fatalf("invalid JSON must not update counts, got %v", counts)
+	}
 
 	// A write carrying the current epoch updates the counts.
-	if err := dbClient.DBUpdateProgress(ctx, "job-1", 5, api.BatchRequestCounts{Total: 10, Completed: 7, Failed: 3}); err != nil {
+	if err := dbClient.DBUpdateProgress(ctx, "job-1", 5, []byte(`{"total":10,"completed":7,"failed":3,"retried":2}`)); err != nil {
 		t.Fatalf("DBUpdateProgress: %v", err)
 	}
 	counts := getCounts(t)
-	if counts == nil || counts["completed"] != float64(7) || counts["failed"] != float64(3) {
-		t.Fatalf("expected completed=7 failed=3 after current-epoch write, got %v", counts)
+	if counts == nil || counts["completed"] != float64(7) || counts["failed"] != float64(3) || counts["retried"] != float64(2) {
+		t.Fatalf("expected progress payload after current-epoch write, got %v", counts)
 	}
 }

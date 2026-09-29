@@ -17,7 +17,7 @@ type dbProgressErrWrapper struct {
 	err error
 }
 
-func (d *dbProgressErrWrapper) DBUpdateProgress(ctx context.Context, id string, epoch int64, counts db.BatchRequestCounts) error {
+func (d *dbProgressErrWrapper) DBUpdateProgress(ctx context.Context, id string, epoch int64, countsJSON []byte) error {
 	return d.err
 }
 
@@ -35,8 +35,8 @@ func (d *dbUpdateErrWrapper) DBGet(ctx context.Context, query *db.BatchQuery, in
 func (d *dbUpdateErrWrapper) DBUpdate(ctx context.Context, item *db.BatchItem, expectedStatus []byte) error {
 	return d.err
 }
-func (d *dbUpdateErrWrapper) DBUpdateProgress(ctx context.Context, id string, epoch int64, counts db.BatchRequestCounts) error {
-	return d.inner.DBUpdateProgress(ctx, id, epoch, counts)
+func (d *dbUpdateErrWrapper) DBUpdateProgress(ctx context.Context, id string, epoch int64, countsJSON []byte) error {
+	return d.inner.DBUpdateProgress(ctx, id, epoch, countsJSON)
 }
 func (d *dbUpdateErrWrapper) DBDelete(ctx context.Context, IDs []string) ([]string, error) {
 	return d.inner.DBDelete(ctx, IDs)
@@ -68,8 +68,8 @@ func (d *dbUpdateFailOnceWrapper) DBUpdate(ctx context.Context, item *db.BatchIt
 	}
 	return d.inner.DBUpdate(ctx, item, expectedStatus)
 }
-func (d *dbUpdateFailOnceWrapper) DBUpdateProgress(ctx context.Context, id string, epoch int64, counts db.BatchRequestCounts) error {
-	return d.inner.DBUpdateProgress(ctx, id, epoch, counts)
+func (d *dbUpdateFailOnceWrapper) DBUpdateProgress(ctx context.Context, id string, epoch int64, countsJSON []byte) error {
+	return d.inner.DBUpdateProgress(ctx, id, epoch, countsJSON)
 }
 func (d *dbUpdateFailOnceWrapper) DBDelete(ctx context.Context, IDs []string) ([]string, error) {
 	return d.inner.DBDelete(ctx, IDs)
