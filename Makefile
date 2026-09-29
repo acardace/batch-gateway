@@ -340,6 +340,7 @@ test-postgres:
 	@test -n "$(TEST_POSTGRES_URL)" || { echo "TEST_POSTGRES_URL is required for PostgreSQL-backed tests"; exit 1; }
 	$(GO) test -count=1 -v ./internal/database/postgresql
 	$(GO) test -count=1 -v ./internal/processor/worker
+	$(GO) test -count=1 -v ./internal/apiserver/batch
 
 ## test-postgres-local: Run PostgreSQL-backed tests in a disposable Docker or Podman container
 test-postgres-local:

@@ -19,6 +19,7 @@ limitations under the License.
 package batch
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -477,10 +478,7 @@ func (c *BatchAPIHandler) CancelBatch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Job is being processed — mark as cancelling and send cancel event.
-	batch.Status = openai.BatchStatusCancelling
-	cancellingAt := time.Now().UTC().Unix()
-	batch.CancellingAt = &cancellingAt
-
+	//
 	// Persist the status change *before* sending the cancel event to prevent a
 	// write-write race between the API server and the worker.
 	//
@@ -492,18 +490,8 @@ func (c *BatchAPIHandler) CancelBatch(w http.ResponseWriter, r *http.Request) {
 	//
 	// By writing first, the API server's "cancelling" is already in the DB before the
 	// worker can act, so any subsequent worker write is the final state.
-
-	tenantID := common.GetTenantIDFromContext(ctx)
-
-	dbItem, err := converter.BatchToDBItem(batch, tenantID, item.Tags)
+	batch, err = c.markCancelling(ctx, item, batch)
 	if err != nil {
-		logger.Error(err, "failed to convert batch to database item")
-		common.WriteInternalServerError(w, r)
-		return
-	}
-
-	dbItem.Epoch = item.Epoch
-	if err := c.clients.BatchDB.DBUpdate(ctx, dbItem, item.Status); err != nil {
 		if errors.Is(err, api.ErrConflict) {
 			apiErr := openai.NewAPIError(http.StatusConflict, "", "batch changed state during cancel, retry", nil)
 			common.WriteAPIError(w, r, apiErr)
@@ -530,4 +518,51 @@ func (c *BatchAPIHandler) CancelBatch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	common.WriteJSONResponse(w, r, http.StatusOK, batch)
+}
+
+const maxCancelAttempts = 3
+
+// markCancelling persists the cancelling transition, conditional on the row's
+// status and epoch. A conflict is retried against the fresh row while its
+// lifecycle status and epoch are unchanged.
+func (c *BatchAPIHandler) markCancelling(ctx context.Context, item *api.BatchItem, batch *openai.Batch) (*openai.Batch, error) {
+	tenantID := common.GetTenantIDFromContext(ctx)
+	fromStatus := batch.Status
+	for attempt := 1; ; attempt++ {
+		batch.Status = openai.BatchStatusCancelling
+		cancellingAt := time.Now().UTC().Unix()
+		batch.CancellingAt = &cancellingAt
+
+		dbItem, err := converter.BatchToDBItem(batch, tenantID, item.Tags)
+		if err != nil {
+			return nil, fmt.Errorf("markCancelling: %w", err)
+		}
+		dbItem.Epoch = item.Epoch
+
+		err = c.clients.BatchDB.DBUpdate(ctx, dbItem, item.Status)
+		if err == nil {
+			return batch, nil
+		}
+		if !errors.Is(err, api.ErrConflict) || attempt == maxCancelAttempts {
+			return nil, err
+		}
+
+		items, _, _, err := c.clients.BatchDB.DBGet(ctx,
+			&api.BatchQuery{BaseQuery: api.BaseQuery{IDs: []string{item.ID}, TenantID: tenantID}},
+			true, 0, 1)
+		if err != nil {
+			return nil, fmt.Errorf("markCancelling: %w", err)
+		}
+		if len(items) != 1 || items[0].Epoch != item.Epoch {
+			return nil, fmt.Errorf("markCancelling: %w", api.ErrConflict)
+		}
+		freshBatch, err := converter.DBItemToBatch(items[0])
+		if err != nil {
+			return nil, fmt.Errorf("markCancelling: %w", err)
+		}
+		if freshBatch.Status != fromStatus {
+			return nil, fmt.Errorf("markCancelling: %w", api.ErrConflict)
+		}
+		item, batch = items[0], freshBatch
+	}
 }
