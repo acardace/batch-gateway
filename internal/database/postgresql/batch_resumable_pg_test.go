@@ -467,6 +467,31 @@ func TestResumableEntryWritesPG(t *testing.T) {
 			t.Fatalf("lapsed lease CheckpointEntryResult: expected ErrConflict, got %v", err)
 		}
 	})
+
+	t.Run("terminal batch fences entry writes even with ownership untouched", func(t *testing.T) {
+		const id = "batch-terminal-owned"
+		epoch := env.activate(t, id)
+
+		// Terminalize the row directly, the way a finalizer commit does,
+		// without clearing processor_id/epoch/owner_lease_expires_at/resumable.
+		// A late write from the batch's own (still-recorded) owner must still
+		// be rejected: mirrors MockResumableStore.ownedFence.
+		if _, err := env.pool.Exec(env.ctx,
+			`UPDATE batch_items SET status = '{"status":"completed"}'::jsonb WHERE id = $1`, id,
+		); err != nil {
+			t.Fatalf("terminalize: %v", err)
+		}
+
+		if _, err := env.store.MarkEntryInFlight(env.ctx, id, "batch_req_b", testProcessorID, epoch); !errors.Is(err, api.ErrConflict) {
+			t.Fatalf("terminal batch MarkEntryInFlight: expected ErrConflict, got %v", err)
+		}
+		_, err := env.store.CheckpointEntryResult(env.ctx, id, "batch_req_a", testProcessorID, epoch,
+			&api.ResumableResult{Status: api.ResumableEntryCompleted,
+				ResultKey: "results/j1/batch_req_a.jsonl", ResultBytes: 10, ResultSHA256: "sha-a"})
+		if !errors.Is(err, api.ErrConflict) {
+			t.Fatalf("terminal batch CheckpointEntryResult: expected ErrConflict, got %v", err)
+		}
+	})
 }
 
 func TestResumableEntryQueriesPG(t *testing.T) {

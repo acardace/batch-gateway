@@ -59,9 +59,15 @@ func (c *PostgresResumableStore) Close() error {
 }
 
 // ownerFence is the shared ownership predicate for entry writes: the batch is
-// owned by the given processor at the given epoch with an unexpired lease.
-const ownerFence = "b.id = e.batch_id AND b.processor_id = $3 AND b.epoch = $4" +
-	" AND b.owner_lease_expires_at > NOW()"
+// owned by the given processor at the given epoch with an unexpired lease,
+// is still an activated resumable batch, and has not reached a terminal
+// status — mirrors MockResumableStore.ownedFence. Without the last two
+// conditions, a terminal write that happens to leave owner/epoch/lease
+// untouched would still let a late MarkEntryInFlight/CheckpointEntryResult
+// mutate an entry of an already-finalized batch.
+var ownerFence = "b.id = e.batch_id AND b.processor_id = $3 AND b.epoch = $4" +
+	" AND b.owner_lease_expires_at > NOW() AND b.resumable = TRUE AND " +
+	buildNonTerminalCondition("b."+colStatus)
 
 // ActivateResumableBatch performs the atomic validating → in_progress
 // transition: it inserts the entry set from a JSON array and flips
