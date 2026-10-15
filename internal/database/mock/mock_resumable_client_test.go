@@ -284,6 +284,21 @@ func TestMockResumableStore_EntryWrites(t *testing.T) {
 			t.Fatalf("missing entry: expected ErrConflict, got %v", err)
 		}
 	})
+
+	t.Run("rejects non-terminal checkpoint statuses", func(t *testing.T) {
+		store, _ := seedActivated(t)
+		for _, status := range []api.ResumableEntryStatus{api.ResumableEntryPending, api.ResumableEntryInFlight} {
+			committed, err := store.CheckpointEntryResult(ctx, "job-1", "r-2", "proc-1", activationEpoch,
+				&api.ResumableResult{Status: status})
+			if err == nil || committed {
+				t.Fatalf("status %q: expected a validation error, got committed=%v err=%v", status, committed, err)
+			}
+		}
+		entry, err := store.FindEntryByRequestID(ctx, "job-1", "r-2")
+		if err != nil || entry == nil || entry.Status != api.ResumableEntryPending {
+			t.Fatalf("rejected checkpoints must not touch the entry: %v %+v", err, entry)
+		}
+	})
 }
 
 func TestMockResumableStore_Queries(t *testing.T) {

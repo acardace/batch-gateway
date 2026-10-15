@@ -214,6 +214,11 @@ func (m *MockResumableStore) CheckpointEntryResult(ctx context.Context, batchID,
 	if result == nil {
 		return false, fmt.Errorf("CheckpointEntryResult: nil result")
 	}
+	// Only terminal statuses commit, mirroring the Postgres implementation.
+	if result.Status != api.ResumableEntryCompleted && result.Status != api.ResumableEntryFailed {
+		return false, fmt.Errorf("CheckpointEntryResult: status must be %q or %q, got %q",
+			api.ResumableEntryCompleted, api.ResumableEntryFailed, result.Status)
+	}
 
 	b, e := m.findEntry(batchID, requestID)
 	if e != nil && !e.Status.IsTerminal() && m.ownedFence(b, processorID, epoch) {
