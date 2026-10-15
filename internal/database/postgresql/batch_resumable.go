@@ -58,16 +58,23 @@ func (c *PostgresResumableStore) Close() error {
 	return c.close()
 }
 
-// ownerFence is the shared ownership predicate for entry writes: the batch is
+// ownerLockCTE is the shared ownership fence for entry writes: the batch is
 // owned by the given processor at the given epoch with an unexpired lease,
 // is still an activated resumable batch, and has not reached a terminal
-// status — mirrors MockResumableStore.ownedFence. Without the last two
-// conditions, a terminal write that happens to leave owner/epoch/lease
-// untouched would still let a late MarkEntryInFlight/CheckpointEntryResult
-// mutate an entry of an already-finalized batch.
-var ownerFence = "b.id = e.batch_id AND b.processor_id = $3 AND b.epoch = $4" +
-	" AND b.owner_lease_expires_at > NOW() AND b.resumable = TRUE AND " +
-	buildNonTerminalCondition("b."+colStatus)
+// status — mirrors MockResumableStore.ownedFence. The FOR UPDATE lock is the
+// point: UPDATE ... FROM reads the FROM relation at the statement snapshot,
+// so without it a RequeueResumableOrphan/FinalizeResumableBatch that commits
+// while an entry write is in flight would not invalidate the fence, and a
+// stale owner could still mutate entries after ownership moved. Locking the
+// row serializes the two: whichever commits first wins. It cannot deadlock —
+// the batch row is the first lock every writer takes.
+var ownerLockCTE = `WITH owner AS (
+	SELECT b.id FROM batch_items b
+	WHERE b.id = $1 AND b.processor_id = $3 AND b.epoch = $4
+	  AND b.owner_lease_expires_at > NOW() AND b.resumable = TRUE
+	  AND ` + buildNonTerminalCondition("b."+colStatus) + `
+	FOR UPDATE
+)`
 
 // ActivateResumableBatch performs the atomic validating → in_progress
 // transition: it inserts the entry set from a JSON array and flips
@@ -195,12 +202,11 @@ func (c *PostgresResumableStore) RequeueResumableOrphan(ctx context.Context, bat
 // returns ErrConflict.
 func (c *PostgresResumableStore) MarkEntryInFlight(ctx context.Context, batchID, requestID, processorID string, epoch int64) (bool, error) {
 	result, err := c.pool.Exec(ctx,
-		`UPDATE batch_entries e
+		ownerLockCTE+`UPDATE batch_entries e
 		SET status = 'in_flight', attempts = attempts + 1, updated_at = NOW()
-		FROM batch_items b
+		FROM owner
 		WHERE e.batch_id = $1 AND e.request_id = $2
-		  AND e.status IN ('pending','in_flight')
-		  AND `+ownerFence,
+		  AND e.status IN ('pending','in_flight')`,
 		batchID, requestID, processorID, epoch,
 	)
 	if err != nil {
@@ -218,6 +224,12 @@ func (c *PostgresResumableStore) MarkEntryInFlight(ctx context.Context, batchID,
 func (c *PostgresResumableStore) CheckpointEntryResult(ctx context.Context, batchID, requestID, processorID string, epoch int64, result *api.ResumableResult) (bool, error) {
 	if result == nil {
 		return false, fmt.Errorf("CheckpointEntryResult: nil result")
+	}
+	// Only terminal statuses commit: a non-terminal one would leave the entry
+	// updatable, letting a later checkpoint overwrite the first-wins result.
+	if result.Status != api.ResumableEntryCompleted && result.Status != api.ResumableEntryFailed {
+		return false, fmt.Errorf("CheckpointEntryResult: status must be %q or %q, got %q",
+			api.ResumableEntryCompleted, api.ResumableEntryFailed, result.Status)
 	}
 	var errorCode any
 	if result.ErrorCode != "" {
@@ -237,13 +249,12 @@ func (c *PostgresResumableStore) CheckpointEntryResult(ctx context.Context, batc
 	}
 
 	updated, err := c.pool.Exec(ctx,
-		`UPDATE batch_entries e
+		ownerLockCTE+`UPDATE batch_entries e
 		SET status = $5, result_key = $6, result_bytes = $7, result_sha256 = $8,
 		    error_code = $9, completed_at = NOW(), updated_at = NOW()
-		FROM batch_items b
+		FROM owner
 		WHERE e.batch_id = $1 AND e.request_id = $2
-		  AND e.status IN ('pending','in_flight')
-		  AND `+ownerFence,
+		  AND e.status IN ('pending','in_flight')`,
 		batchID, requestID, processorID, epoch,
 		string(result.Status), resultKey, resultBytes, resultSHA256, errorCode,
 	)

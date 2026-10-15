@@ -492,6 +492,76 @@ func TestResumableEntryWritesPG(t *testing.T) {
 			t.Fatalf("terminal batch CheckpointEntryResult: expected ErrConflict, got %v", err)
 		}
 	})
+
+	t.Run("rejects non-terminal checkpoint statuses", func(t *testing.T) {
+		for _, status := range []api.ResumableEntryStatus{api.ResumableEntryPending, api.ResumableEntryInFlight} {
+			committed, err := env.store.CheckpointEntryResult(env.ctx, batchID, "batch_req_b", testProcessorID, epoch,
+				&api.ResumableResult{Status: status, ResultKey: "k", ResultBytes: 1, ResultSHA256: "s"})
+			if err == nil || committed {
+				t.Fatalf("status %q: expected a validation error, got committed=%v err=%v", status, committed, err)
+			}
+		}
+		entry, ferr := env.store.FindEntryByRequestID(env.ctx, batchID, "batch_req_b")
+		if ferr != nil || entry == nil || entry.Status != api.ResumableEntryPending || entry.Attempts != 0 {
+			t.Fatalf("rejected checkpoints must not touch the entry: %v %+v", ferr, entry)
+		}
+	})
+
+	t.Run("entry writes serialize with a concurrent requeue of the batch row", func(t *testing.T) {
+		const id = "batch-entry-lock"
+		epoch := env.activate(t, id)
+
+		conn, err := env.pool.Acquire(env.ctx)
+		if err != nil {
+			t.Fatalf("acquire conn: %v", err)
+		}
+		defer conn.Release()
+		tx, err := conn.Begin(env.ctx)
+		if err != nil {
+			t.Fatalf("begin: %v", err)
+		}
+		// The requeue's UPDATE, held uncommitted so it owns the batch row lock.
+		if _, err := tx.Exec(env.ctx,
+			`UPDATE batch_items
+			 SET processor_id = NULL, owner_lease_expires_at = NULL,
+			     epoch = epoch + 1, recovery_attempts = recovery_attempts + 1
+			 WHERE id = $1`, id,
+		); err != nil {
+			t.Fatalf("lock batch row: %v", err)
+		}
+
+		type outcome struct {
+			committed bool
+			err       error
+		}
+		done := make(chan outcome, 1)
+		go func() {
+			committed, err := env.store.CheckpointEntryResult(env.ctx, id, "batch_req_a", testProcessorID, epoch,
+				&api.ResumableResult{Status: api.ResumableEntryCompleted, ResultKey: "k", ResultBytes: 1, ResultSHA256: "s"})
+			done <- outcome{committed, err}
+		}()
+
+		// The checkpoint must block on the batch-row lock: committing against
+		// the pre-requeue snapshot would be exactly the fenced-out stale write.
+		select {
+		case o := <-done:
+			t.Fatalf("checkpoint completed while the requeue held the batch row: committed=%v err=%v", o.committed, o.err)
+		case <-time.After(500 * time.Millisecond):
+		}
+
+		if err := tx.Commit(env.ctx); err != nil {
+			t.Fatalf("commit requeue: %v", err)
+		}
+
+		select {
+		case o := <-done:
+			if !errors.Is(o.err, api.ErrConflict) {
+				t.Fatalf("expected ErrConflict after the requeue committed, got committed=%v err=%v", o.committed, o.err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("checkpoint did not return after the requeue committed")
+		}
+	})
 }
 
 func TestResumableEntryQueriesPG(t *testing.T) {
