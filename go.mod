@@ -14,8 +14,8 @@ require (
 	github.com/go-resty/resty/v2 v2.17.2
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.11.0
-	github.com/llm-d/llm-d-async/api v0.9.1
-	github.com/llm-d/llm-d-async/producer v0.9.1
+	github.com/llm-d/llm-d-async/api v1.0.0
+	github.com/llm-d/llm-d-async/producer v1.0.0
 	github.com/pashagolub/pgxmock/v5 v5.2.0
 	github.com/prometheus/client_golang v1.24.1
 	github.com/quasilyte/go-ruleguard/dsl v0.3.23
@@ -76,7 +76,7 @@ require (
 	golang.org/x/oauth2 v0.37.0 // indirect
 	golang.org/x/term v0.46.0 // indirect
 	golang.org/x/text v0.42.0 // indirect
-	golang.org/x/time v0.14.0 // indirect
+	golang.org/x/time v0.16.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260928230214-8a89bd6388cc // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260928230214-8a89bd6388cc // indirect
 	google.golang.org/grpc v1.84.0 // indirect
