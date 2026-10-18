@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -17,13 +18,33 @@ import (
 const defaultResultBuffer = 64
 
 // BroadcasterGroup is a set of broadcasters for subscribe/unsubscribe.
-// Lifecycle (Run/Wait) is owned by the registry that created them.
+// Lifecycle (Run/Wait) is owned by the registry that created them; a
+// recovery broadcaster among them is deferred until Start is called so its
+// first claim happens only after the subscribing job is registered.
 type BroadcasterGroup struct {
 	broadcasters []*ResultBroadcaster
+	starts       []func()
+	startOnce    sync.Once
 }
 
-func NewBroadcasterGroup(broadcasters []*ResultBroadcaster) *BroadcasterGroup {
-	return &BroadcasterGroup{broadcasters: broadcasters}
+func NewBroadcasterGroup(broadcasters []*ResultBroadcaster, starts ...func()) *BroadcasterGroup {
+	return &BroadcasterGroup{broadcasters: broadcasters, starts: starts}
+}
+
+// Start launches the group's deferred broadcasters. It must run after
+// Subscribe: a recovery broadcaster that claims a delivery on the previous
+// submitter's route before its job has subscribed routes to no owner, so the
+// delivery is held unacked for the whole claim lease instead of being
+// checkpointed. Normal (per-model) broadcasters are already running — the
+// registry starts them — and contribute no start function.
+func (bs *BroadcasterGroup) Start() {
+	bs.startOnce.Do(func() {
+		for _, start := range bs.starts {
+			if start != nil {
+				start()
+			}
+		}
+	})
 }
 
 func (bs *BroadcasterGroup) Subscribe(ch chan<- ResultItem, owns func(string) bool) {

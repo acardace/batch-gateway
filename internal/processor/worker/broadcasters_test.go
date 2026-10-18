@@ -72,6 +72,7 @@ func TestBroadcasterRegistry_RecoveryRoutes(t *testing.T) {
 	pending.Store(pipeline.RequestItem{RequestID: "req-stranded", CustomID: "c-1"})
 	resultCh := make(chan pipeline.ResultItem, 1)
 	group.Subscribe(resultCh, pending.Has)
+	group.Start()
 
 	registry.mu.Lock()
 	refs := 0
@@ -194,14 +195,12 @@ func TestResidueGate(t *testing.T) {
 	})
 }
 
-// TestBroadcasterRegistry_MisClaimConverges pins the cross-processor
-// mis-claim path: a recovery broadcaster can claim a delivery whose entry
-// another processor owns (two processors recovering from the same dead
-// submitter split the route's claims). The foreign claim must be held
-// unacked — the durable residue gate sees the open entry — under the short
-// recovery lease, and the delivery must reach its owner after that lease
-// lapses, instead of bouncing for a full crash-detection window.
-func TestBroadcasterRegistry_MisClaimConverges(t *testing.T) {
+// TestBroadcasterRegistry_RecoveryGatedOnSubscription pins the ordering
+// contract: a recovery broadcaster must not claim a delivery already sitting
+// on the previous submitter's route until the acquiring job has subscribed.
+// A claim with no subscriber routes to nobody and is held unacked for the
+// whole claim lease; gating consumption on Subscribe avoids that delay.
+func TestBroadcasterRegistry_RecoveryGatedOnSubscription(t *testing.T) {
 	mr := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = rdb.Close() })
@@ -211,7 +210,7 @@ func TestBroadcasterRegistry_MisClaimConverges(t *testing.T) {
 		ConsumerID:        "proc-b",
 		ResultPollTimeout: 2 * time.Second,
 		Models: map[string]inference.AsyncModelPoolConfig{
-			"m1": {PoolName: "mis-pool"},
+			"m1": {PoolName: "gate-pool"},
 		},
 	}, logr.Discard())
 	if err != nil {
@@ -219,7 +218,6 @@ func TestBroadcasterRegistry_MisClaimConverges(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = resolver.Close() })
 
-	// The residue gate reports every entry open: nothing may be discarded.
 	registry := newBroadcasterRegistry(resolver, logr.Discard(), func(context.Context, string) (bool, error) {
 		return false, nil
 	})
@@ -230,17 +228,11 @@ func TestBroadcasterRegistry_MisClaimConverges(t *testing.T) {
 		registry.Wait()
 	})
 
-	modelMap := &modelMapFile{SafeToModel: map[string]string{"m1": "m1"}, LineCount: 1}
-	ownerPending := pipeline.NewPendingRequests(1)
-	ownerCh := make(chan pipeline.ResultItem, 1)
-
-	// The wrong consumer phase: the recovery broadcaster runs with no owner
-	// subscribed for the delivery (the owning job sits on another processor).
-	group, release := registry.forModels(modelMap, []string{"proc-a"})
-	defer release()
-
-	ownerRoute := "llm-d-async:results:mis-pool:proc-a"
-	data, err := json.Marshal(asyncapi.ResultMessage{ID: "req-foreign", StatusCode: 200, Payload: `{"ok":true}`})
+	// A completed result for the recovered entry is already on proc-a's
+	// route before the job's group is even built.
+	ownerRoute := "llm-d-async:results:gate-pool:proc-a"
+	idxKey := ownerRoute + ":result-claims-idx"
+	data, err := json.Marshal(asyncapi.ResultMessage{ID: "req-gated", StatusCode: 200, Payload: `{"ok":true}`})
 	if err != nil {
 		t.Fatalf("marshal result: %v", err)
 	}
@@ -248,11 +240,105 @@ func TestBroadcasterRegistry_MisClaimConverges(t *testing.T) {
 		t.Fatalf("push result: %v", err)
 	}
 
-	// The mis-claimed delivery is held unacked: the claim sits in the route's
-	// expiry index under the short recovery lease.
+	modelMap := &modelMapFile{SafeToModel: map[string]string{"m1": "m1"}, LineCount: 1}
+	group, release := registry.forModels(modelMap, []string{"proc-a"})
+	defer release()
+
+	// Not yet subscribed or started: the broadcaster must leave the delivery
+	// unclaimed, not consume it into a lease.
+	time.Sleep(300 * time.Millisecond)
+	if n, err := rdb.ZCard(context.Background(), idxKey).Result(); err != nil {
+		t.Fatalf("read claims: %v", err)
+	} else if n != 0 {
+		t.Fatalf("delivery was claimed before the job subscribed (%d claims)", n)
+	}
+
+	// Subscribe first, then Start: the claim happens with the subscriber
+	// present and routes immediately.
+	pending := pipeline.NewPendingRequests(1)
+	pending.Store(pipeline.RequestItem{RequestID: "req-gated", CustomID: "c-1"})
+	resultCh := make(chan pipeline.ResultItem, 1)
+	group.Subscribe(resultCh, pending.Has)
+	group.Start()
+
+	select {
+	case result := <-resultCh:
+		if result.RequestID != "req-gated" {
+			t.Fatalf("routed result = %q, want req-gated", result.RequestID)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("gated delivery was not routed after subscribe+start")
+	}
+}
+
+// TestBroadcasterRegistry_MisClaimCompetingReplicas pins the documented
+// cross-replica limitation and its bound: two replacement processors that
+// recovered different batches from the same dead submitter both consume that
+// submitter's route, so either can claim the other's result. The foreign
+// claim is held unacked — the residue gate sees the still-open entry — under
+// the short recovery lease, and once that lease lapses the delivery reaches
+// its rightful owner instead of re-running inference.
+func TestBroadcasterRegistry_MisClaimCompetingReplicas(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	newResolver := func(consumerID string) *inference.AsyncGatewayResolver {
+		t.Helper()
+		r, err := inference.NewAsyncResolver(inference.AsyncClientConfig{
+			RedisURL:          "redis://" + mr.Addr(),
+			ConsumerID:        consumerID,
+			ResultPollTimeout: 2 * time.Second,
+			Models: map[string]inference.AsyncModelPoolConfig{
+				"m1": {PoolName: "comp-pool"},
+			},
+		}, logr.Discard())
+		if err != nil {
+			t.Fatalf("NewAsyncResolver(%s): %v", consumerID, err)
+		}
+		t.Cleanup(func() { _ = r.Close() })
+		return r
+	}
+	openEntry := func(context.Context, string) (bool, error) { return false, nil }
+
+	// Two replacement processors recovering different batches from the same
+	// dead submitter proc-a: both consume proc-a's result route.
+	regB := newBroadcasterRegistry(newResolver("proc-b"), logr.Discard(), openEntry)
+	regC := newBroadcasterRegistry(newResolver("proc-c"), logr.Discard(), openEntry)
+	ctxB, cancelB := context.WithCancel(context.Background())
+	ctxC, cancelC := context.WithCancel(context.Background())
+	regB.Run(ctxB)
+	regC.Run(ctxC)
+	t.Cleanup(func() {
+		cancelB()
+		cancelC()
+		regB.Wait()
+		regC.Wait()
+	})
+
+	ownerRoute := "llm-d-async:results:comp-pool:proc-a"
 	idxKey := ownerRoute + ":result-claims-idx"
-	deadline := time.Now().Add(5 * time.Second)
+	data, err := json.Marshal(asyncapi.ResultMessage{ID: "req-owned", StatusCode: 200, Payload: `{"ok":true}`})
+	if err != nil {
+		t.Fatalf("marshal result: %v", err)
+	}
+	if _, err := rdb.LPush(context.Background(), ownerRoute, string(data)).Result(); err != nil {
+		t.Fatalf("push result: %v", err)
+	}
+
+	modelMap := &modelMapFile{SafeToModel: map[string]string{"m1": "m1"}, LineCount: 1}
+
+	// Processor B's job does not own req-owned: its recovery broadcaster
+	// claims the delivery and, seeing an open entry, holds it unacked.
+	groupB, releaseB := regB.forModels(modelMap, []string{"proc-a"})
+	defer releaseB()
+	pendingB := pipeline.NewPendingRequests(1)
+	chB := make(chan pipeline.ResultItem, 1)
+	groupB.Subscribe(chB, pendingB.Has)
+	groupB.Start()
+
 	var lease time.Duration
+	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		members, err := rdb.ZRangeWithScores(context.Background(), idxKey, 0, -1).Result()
 		if err != nil {
@@ -265,7 +351,7 @@ func TestBroadcasterRegistry_MisClaimConverges(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	if lease <= 0 {
-		t.Fatal("the mis-claimed delivery was not held as an unacked claim")
+		t.Fatal("the foreign processor did not hold the mis-claimed delivery as an unacked claim")
 	}
 	// The recovery claim lease is short (60s), not the 5m crash-detection
 	// window: a mis-claim costs one brief bounce.
@@ -273,21 +359,29 @@ func TestBroadcasterRegistry_MisClaimConverges(t *testing.T) {
 		t.Fatalf("recovery claim lease = %v, want the short recovery lease (<=90s)", lease)
 	}
 
-	// The owning job appears (here: on this registry) and pre-stores the
-	// request; the short lease lapses, and the redelivery routes to it.
-	ownerPending.Store(pipeline.RequestItem{RequestID: "req-foreign", CustomID: "c-1"})
-	group.Subscribe(ownerCh, ownerPending.Has)
+	// Processor C owns the request; its job subscribes and starts.
+	groupC, releaseC := regC.forModels(modelMap, []string{"proc-a"})
+	defer releaseC()
+	pendingC := pipeline.NewPendingRequests(1)
+	pendingC.Store(pipeline.RequestItem{RequestID: "req-owned", CustomID: "c-1"})
+	chC := make(chan pipeline.ResultItem, 1)
+	groupC.Subscribe(chC, pendingC.Has)
+	groupC.Start()
+
+	// B's batch ends elsewhere; its stale claim lapses and the redelivery
+	// reaches its rightful owner.
+	cancelB()
 	if _, err := rdb.ZAdd(context.Background(), idxKey, redis.Z{
-		Member: "req-foreign",
+		Member: "req-owned",
 		Score:  float64(time.Now().Add(-time.Hour).UnixMilli()),
 	}).Result(); err != nil {
 		t.Fatalf("backdate claim lease: %v", err)
 	}
 
 	select {
-	case result := <-ownerCh:
-		if result.RequestID != "req-foreign" {
-			t.Fatalf("routed result = %q, want req-foreign", result.RequestID)
+	case result := <-chC:
+		if result.RequestID != "req-owned" {
+			t.Fatalf("routed result = %q, want req-owned", result.RequestID)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("the mis-claimed delivery did not reach its owner after the lease lapsed")

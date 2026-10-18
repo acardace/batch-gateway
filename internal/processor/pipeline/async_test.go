@@ -664,7 +664,7 @@ func TestAsyncCancellation(t *testing.T) {
 				}
 				ticker := time.NewTicker(time.Millisecond)
 				defer ticker.Stop()
-				for pending.pending.Load() != int64(len(items)-3) {
+				for pending.pendingCount() != int64(len(items)-3) {
 					select {
 					case <-ticker.C:
 					case <-ctx.Done():

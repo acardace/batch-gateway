@@ -198,18 +198,33 @@ func (s *PlanFileSource) Produce(ctx context.Context, outgoingRequestCh chan<- p
 // set), so a fully recovered batch can skip the rest of the window.
 const recoveryResolvedPoll = time.Second
 
-// waitForRecoveryWindow pauses before submitting recoverable entries —
-// bounded by the remaining SLO budget so a short-deadline batch still gets
-// its fallback submissions. The wait also ends early once no held entry is
-// still pending: every stranded delivery was received and checkpointed, so
-// the fence will drop the held items as terminal duplicates and waiting the
-// rest of the window buys nothing. Cancellation ends the wait early too; the
-// dispatcher's drain path accounts the entries from there.
+// waitForRecoveryWindow pauses before submitting recoverable entries. The
+// wait also ends early once no held entry is still pending: every stranded
+// delivery was received and checkpointed, so the fence will drop the held
+// items as terminal duplicates and waiting the rest of the window buys
+// nothing. Cancellation ends the wait early too; the dispatcher's drain path
+// accounts the entries from there.
+//
+// The wait must leave the fallback submissions a real execution budget: if
+// it ran up to the SLO deadline, the held entries would be handed to the
+// dispatcher exactly when the execution context expires, and PreDispatcher
+// would turn each into an expiry error instead of submitting it. So the
+// wait reserves one recovery window of execution time — deferring at most
+// min(window, remaining-window) — and when the remaining SLO cannot cover
+// the window plus that reserve, recovery is skipped and the held entries
+// submit immediately, with the whole remaining budget.
 func (s *PlanFileSource) waitForRecoveryWindow(ctx context.Context, held []pipeline.RequestItem) {
 	wait := s.recoveryWindow
 	if !s.sloDeadline.IsZero() {
-		if until := time.Until(s.sloDeadline); until < wait {
-			wait = until
+		remaining := time.Until(s.sloDeadline)
+		budget := remaining - s.recoveryWindow
+		if budget <= 0 {
+			s.logger.Info("Skipping the recovery window to preserve the SLO budget for fallback submission",
+				"remaining", remaining, "window", s.recoveryWindow)
+			return
+		}
+		if budget < wait {
+			wait = budget
 		}
 	}
 	if wait <= 0 {

@@ -81,7 +81,7 @@ func TestResultCheckpointer_Drain(t *testing.T) {
 		// the request must still be pending (Resolve comes afterwards).
 		sink := &fakeSink{}
 		sink.fn = func(msg *ResultItem) (bool, error) {
-			if _, ok := pending.m.Load(msg.RequestID); !ok {
+			if !pending.Has(msg.RequestID) {
 				return false, fmt.Errorf("checkpoint for %s ran after resolve", msg.RequestID)
 			}
 			return true, nil

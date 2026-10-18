@@ -65,6 +65,12 @@ type recoveryBroadcaster struct {
 	b      *pipeline.ResultBroadcaster
 	refs   int
 	cancel context.CancelFunc
+	// start launches the receive loop exactly once. Consumption is deferred
+	// until the acquiring job has subscribed (BroadcasterGroup.Start), so
+	// the broadcaster never claims a delivery before a subscriber can route
+	// it — a claim with no subscriber would be held for the whole claim
+	// lease instead of being checkpointed.
+	start func()
 }
 
 func newBroadcasterRegistry(resolver *inference.AsyncGatewayResolver, logger logr.Logger, residueSafe func(ctx context.Context, requestID string) (bool, error)) *broadcasterRegistry {
@@ -110,9 +116,10 @@ func (r *broadcasterRegistry) Wait() {
 // forModels returns the broadcaster group a job on the given models
 // subscribes to: this processor's per-model broadcasters plus, for every
 // previous submitter of an in-flight entry, a recovery broadcaster that
-// consumes that submitter's result route. The returned release function
-// drops the job's references; the last release stops the recovery
-// broadcasters it no longer needs.
+// consumes that submitter's result route. The returned group's Start
+// launches the recovery consumption and must be called after the job
+// subscribes; the returned release function drops the job's references, and
+// the last release stops the recovery broadcasters it no longer needs.
 func (r *broadcasterRegistry) forModels(modelMap *modelMapFile, submitters []string) (*pipeline.BroadcasterGroup, func()) {
 	group := make([]*pipeline.ResultBroadcaster, 0, len(modelMap.SafeToModel))
 	for _, modelID := range modelMap.SafeToModel {
@@ -122,20 +129,22 @@ func (r *broadcasterRegistry) forModels(modelMap *modelMapFile, submitters []str
 	}
 
 	var acquired []recoveryRouteKey
+	var starts []func()
 	for _, consumer := range submitters {
 		if consumer == "" {
 			continue
 		}
 		for _, modelID := range modelMap.SafeToModel {
-			if b := r.acquireRecovery(modelID, consumer); b != nil {
+			if b, start := r.acquireRecovery(modelID, consumer); b != nil {
 				group = append(group, b)
 				acquired = append(acquired, recoveryRouteKey{model: modelID, consumer: consumer})
+				starts = append(starts, start)
 			}
 		}
 	}
 
 	once := sync.Once{}
-	return pipeline.NewBroadcasterGroup(group), func() {
+	return pipeline.NewBroadcasterGroup(group, starts...), func() {
 		once.Do(func() {
 			for _, key := range acquired {
 				r.releaseRecovery(key)
@@ -145,26 +154,29 @@ func (r *broadcasterRegistry) forModels(modelMap *modelMapFile, submitters []str
 }
 
 // acquireRecovery returns the recovery broadcaster for a foreign result
-// route, creating and starting it on first use. It returns nil when the
-// route cannot be built (e.g. a test resolver without Redis) — recovery
-// then degrades to re-submission after the recovery window.
-func (r *broadcasterRegistry) acquireRecovery(modelID, consumerID string) *pipeline.ResultBroadcaster {
+// route, creating it on first use, plus the function that starts its receive
+// loop. The loop is not started here: the caller starts it (via the group)
+// only after subscribing, so a delivery already on the route is claimed with
+// a subscriber present. It returns nil when the route cannot be built (e.g.
+// a test resolver without Redis) — recovery then degrades to re-submission
+// after the recovery window.
+func (r *broadcasterRegistry) acquireRecovery(modelID, consumerID string) (*pipeline.ResultBroadcaster, func()) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	key := recoveryRouteKey{model: modelID, consumer: consumerID}
 	if rb, ok := r.recovery[key]; ok {
 		rb.refs++
-		return rb.b
+		return rb.b, rb.start
 	}
 	if r.baseCtx == nil || r.baseCtx.Err() != nil {
-		return nil
+		return nil, nil
 	}
 	client, err := r.resolver.RecoveryClientFor(modelID, consumerID)
 	if err != nil {
 		r.logger.Info("Recovery route unavailable; in-flight entries fall back to re-submission",
 			"model", modelID, "consumer", consumerID, "err", err)
-		return nil
+		return nil, nil
 	}
 	ctx, cancel := context.WithCancel(r.baseCtx)
 	b := pipeline.NewResultBroadcaster(client, r.logger.WithValues("model", modelID, "recoveryFor", consumerID))
@@ -172,16 +184,21 @@ func (r *broadcasterRegistry) acquireRecovery(modelID, consumerID string) *pipel
 		b = b.WithResidueSafetyCheck(r.residueSafe)
 	}
 	rb := &recoveryBroadcaster{b: b, cancel: cancel}
+	var once sync.Once
+	rb.start = func() {
+		once.Do(func() {
+			r.wg.Add(1)
+			go func() {
+				defer r.wg.Done()
+				b.Run(ctx)
+			}()
+		})
+	}
 	r.recovery[key] = rb
 	rb.refs++
-	r.wg.Add(1)
-	go func() {
-		defer r.wg.Done()
-		b.Run(ctx)
-	}()
-	r.logger.Info("Started recovery broadcaster for a previous submitter's result route",
+	r.logger.Info("Recovery route ready; consumption starts once the job subscribes",
 		"model", modelID, "consumer", consumerID)
-	return b
+	return b, rb.start
 }
 
 // releaseRecovery drops one reference; the last release stops the

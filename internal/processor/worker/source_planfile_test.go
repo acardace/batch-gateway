@@ -888,10 +888,12 @@ func TestPlanFileSource_Produce_RecoversInFlightEntries(t *testing.T) {
 	}
 }
 
-// TestPlanFileSource_Produce_RecoveryWindowSLOCap verifies a batch whose
-// SLO budget is shorter than the recovery window submits the held entries
-// when the SLO caps the wait, not after the full window.
-func TestPlanFileSource_Produce_RecoveryWindowSLOCap(t *testing.T) {
+// TestPlanFileSource_Produce_RecoveryWindowSLOBypass verifies that when the
+// remaining SLO budget cannot cover the recovery window plus a fallback
+// execution reserve, the source skips the wait and submits the held entries
+// immediately — with real time left to run — instead of consuming the SLO
+// down to the deadline and turning the fallback into an expiry error.
+func TestPlanFileSource_Produce_RecoveryWindowSLOBypass(t *testing.T) {
 	const batchID = "batch-slo"
 	inputFile, dir, ids := writeThreeRequestPlan(t, batchID)
 
@@ -899,6 +901,7 @@ func TestPlanFileSource_Produce_RecoveryWindowSLOCap(t *testing.T) {
 	resolver := inference.NewSingleClientResolver(client)
 	defer func() { _ = resolver.Close() }()
 
+	sloDeadline := time.Now().Add(30 * time.Second)
 	source := NewPlanFileSource(PlanFileSourceConfig{
 		InputFile:      inputFile,
 		PlansDir:       filepath.Join(dir, "plans"),
@@ -906,23 +909,32 @@ func TestPlanFileSource_Produce_RecoveryWindowSLOCap(t *testing.T) {
 		Resolver:       resolver,
 		Cfg:            config.NewConfig(),
 		BatchID:        batchID,
-		SLODeadline:    time.Now().Add(150 * time.Millisecond),
+		SLODeadline:    sloDeadline,
 		Recover:        map[string]struct{}{ids[2]: {}},
-		RecoveryWindow: 30 * time.Second,
+		RecoveryWindow: 5 * time.Minute, // far longer than the remaining SLO
+		PreStore:       func(pipeline.RequestItem) {},
 		Logger:         logr.Discard(),
 	})
 
+	// The real job path runs Produce under a context that expires at the SLO
+	// deadline; the old cap-at-deadline wait emitted the fallback right as
+	// this context died.
+	ctx, cancel := context.WithDeadline(context.Background(), sloDeadline)
+	defer cancel()
 	out := make(chan pipeline.RequestItem)
 	done := make(chan error, 1)
-	go func() { done <- source.Produce(context.Background(), out) }()
+	go func() { done <- source.Produce(ctx, out) }()
 
 	deadline := time.Now().Add(2 * time.Second)
 	for range 3 {
 		select {
 		case <-out:
 		case <-time.After(time.Until(deadline)):
-			t.Fatal("held entries were not submitted within the SLO-capped window")
+			t.Fatal("held entries were not submitted promptly; the recovery window consumed the SLO budget")
 		}
+	}
+	if remaining := time.Until(sloDeadline); remaining < 20*time.Second {
+		t.Fatalf("submissions consumed the SLO budget: only %v left of 30s", remaining)
 	}
 	if err := <-done; err != nil {
 		t.Fatalf("Produce: %v", err)

@@ -213,6 +213,18 @@ func NewAsyncResolver(config AsyncClientConfig, logger logr.Logger) (*AsyncGatew
 // a foreign claim is held unacked (its entry is open) until the lease
 // lapses, so a short lease turns that mis-claim into a brief bounce instead
 // of a full crash-detection window.
+//
+// This bounds the cost of a mis-claim; it does not eliminate it. A result
+// route is keyed by the foreign submitter (not by batch), so every processor
+// recovering any of that submitter's batches consumes the whole route and
+// claims are exclusive: a processor can hold a delivery that belongs to
+// another processor's batch for up to this lease, and nothing guarantees the
+// rightful owner wins the next claim (both poll the route). The design stays
+// at-least-once-safe — an unowned delivery is never acknowledged while its
+// entry is open, so it is redelivered rather than lost — but in the worst
+// case it delays recovery into re-submission (replayed inference) or SLO
+// expiry. Fully removing this needs per-batch routing or cross-replica
+// forwarding of deliveries to their current batch owner.
 const recoveryClaimLeaseTTL = 60 * time.Second
 
 // RecoveryClientFor returns a client that consumes the per-processor result

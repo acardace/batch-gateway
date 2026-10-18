@@ -21,7 +21,7 @@ func TestPendingRequests_Enrich(t *testing.T) {
 		if result.CustomID != "c1" || result.ModelID != "m1" || !result.SubmittedAt.Equal(submitted) {
 			t.Fatalf("enriched result = %+v", result)
 		}
-		if _, ok := p.m.Load("r1"); !ok {
+		if !p.Has("r1") {
 			t.Fatal("Enrich removed the pending entry")
 		}
 	})
@@ -34,7 +34,7 @@ func TestPendingRequests_Enrich(t *testing.T) {
 		if !p.Enrich(result) {
 			t.Fatal("Enrich returned false for pending error result")
 		}
-		if _, ok := p.m.Load("r1"); !ok {
+		if !p.Has("r1") {
 			t.Fatal("Enrich removed the pending entry")
 		}
 	})
@@ -328,6 +328,71 @@ func TestPendingRequests(t *testing.T) {
 			t.Fatal("Wait did not return after DrainUnresolved")
 		}
 	})
+}
+
+// TestPendingRequests_StoreResolveInterleaving pins the fallback-submission
+// race the previous split map+atomic design admitted: a Store that refreshes
+// an entry concurrent with a Resolve removing the same entry must not
+// resurrect an uncounted entry. If it did, resolving that phantom entry
+// could drive the count to zero while another request (B) is still in
+// flight, Wait would return, and DrainUnresolved would commit B as
+// batch_failed.
+func TestPendingRequests_StoreResolveInterleaving(t *testing.T) {
+	const iterations = 1000
+	for i := range iterations {
+		p := NewPendingRequests(0)
+		p.Store(RequestItem{RequestID: "A", CustomID: "a"})
+		p.Store(RequestItem{RequestID: "B", CustomID: "b"}) // stays pending
+
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			// The refresh path a re-submitted recovered entry takes.
+			p.Store(RequestItem{RequestID: "A", CustomID: "a", ModelID: "refreshed"})
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			p.Resolve(&ResultItem{RequestID: "A"})
+		}()
+		close(start)
+		wg.Wait()
+
+		done := make(chan struct{})
+		go func() {
+			p.Wait(context.Background())
+			close(done)
+		}()
+		assertPending := func(stage string) {
+			t.Helper()
+			select {
+			case <-done:
+				t.Fatalf("iteration %d: Wait returned prematurely %s; B is still pending", i, stage)
+			case <-time.After(time.Millisecond):
+			}
+		}
+
+		// B is always outstanding after the race, regardless of how A
+		// interleaved.
+		assertPending("after the Store/Resolve race")
+
+		// Remove A if the refresh re-added it (no-op otherwise). On the
+		// buggy design this resolve could zero the count while B is live.
+		p.Resolve(&ResultItem{RequestID: "A"})
+		assertPending("after resolving A")
+
+		if !p.Resolve(&ResultItem{RequestID: "B"}) {
+			t.Fatalf("iteration %d: B did not resolve", i)
+		}
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatalf("iteration %d: Wait did not return after B resolved", i)
+		}
+	}
 }
 
 // TestPendingRequests_Has covers the per-request routing predicate: a

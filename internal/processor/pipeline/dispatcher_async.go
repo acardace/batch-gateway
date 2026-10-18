@@ -41,6 +41,10 @@ func NewAsyncDispatcher(
 
 func (d *AsyncDispatcher) Run(ctx context.Context, requestCh <-chan RequestItem, resultCh chan<- ResultItem) error {
 	d.broadcasters.Subscribe(resultCh, d.pending.Has)
+	// Recovery broadcasters only begin claiming once this job is subscribed,
+	// so a delivery already sitting on a previous submitter's route routes
+	// here instead of being held for the claim lease.
+	d.broadcasters.Start()
 
 	// Submit phase — fast queue writes.
 	for msg := range requestCh {
