@@ -30,7 +30,7 @@ For full details, see the [llm-d Router flow-control guide](https://github.com/l
 |Interactive|100|Interactive requests|round-robin|fcfs|Low latency, fair across tenants|
 |Batch|-1|Batch requests|global-strict|slo-deadline|Sheddable; maximizes throughput, dispatches by SLO urgency|
 
-**Why this works:** When the backend is not saturated, both bands dispatch freely. When saturation reaches 1.0 and head-of-line blocking activates, the priority hierarchy ensures interactive requests (priority 100) are dispatched before batch requests (priority -1). Because batch requests have negative priority, they are **sheddable**, so they yield to interactive traffic. With the `flowControl` feature gate enabled they buffer under the band's capacity limits and queue TTL and are shed when either is exhausted (HTTP 429/503); without the gate they are rejected on arrival once the pool is saturated. Batch dispatch resumes as soon as saturation drops. Interactive requests without an `InferenceObjective` header default to priority 0 and are still protected, since they outrank the -1 batch band. If batch requests are queued but saturation persists, they are evicted when their TTL expires.
+**Why this works:** When the backend is not saturated, both bands dispatch freely. When saturation reaches 1.0 and head-of-line blocking activates, the priority hierarchy ensures interactive requests (priority 100) are dispatched before batch requests (priority -1). Because batch requests have negative priority, they are **sheddable**, so they yield to interactive traffic. With the `flowControl` feature gate enabled they buffer under the band's capacity limits and queue TTL instead of being rejected on arrival, and are shed when either is exhausted; without the gate they are rejected on arrival once the pool is saturated. Batch dispatch resumes as soon as saturation drops. Interactive requests without an `InferenceObjective` header default to priority 0 and are still protected, since they outrank the -1 batch band. If batch requests are queued but saturation persists, they are evicted when their TTL expires.
 
 **Why sheddable (negative priority) for batch:** With non-negative priority, batch requests would compete with interactive traffic for queue capacity. Negative priority keeps them at the bottom of the dispatch order and lets the batch processor absorb the backpressure it is already designed to handle. The processor sends a fresh `x-slo-ttft-ms` on each retry, so retried requests are re-prioritized correctly by SLO urgency when they're eventually admitted.
 
@@ -245,7 +245,7 @@ model_gateways:
 #### Key Considerations
 
 - **`request_timeout`**: With flow control enabled, requests may spend time in the Router EPP queue before reaching the backend. Set this high enough to accommodate queuing time plus inference time. 5 minutes is a reasonable starting point.
-- **`max_retries` and `max_backoff`**: When the system is saturated, the Router EPP sheds batch requests: a queued request whose TTL expires gets HTTP 503 ("request timed out in queue"), and a request that finds its priority band's byte budget full gets HTTP 429. Retry backoff slows resubmission pressure, while AIMD separately lowers per-endpoint concurrency (`aimd.backoff_factor`) and later raises it gradually (`aimd.additive_increase`) as successes accumulate.
+- **`max_retries` and `max_backoff`**: When the system is saturated, the Router EPP sheds batch requests and the processor retries with backoff. A queued request whose TTL expires, or one that finds its priority band's `maxRequests`/`maxBytes` exhausted, is rejected with HTTP 429 (`ResourceExhausted`); HTTP 503 is reserved for when the pool has no endpoints at all, e.g. scale-from-zero. Retry backoff slows resubmission pressure, while AIMD separately lowers per-endpoint concurrency (`aimd.backoff_factor`) and later raises it gradually (`aimd.additive_increase`) as successes accumulate.
 - **AIMD with flow control**: Flow control decides queueing/shedding priority in the Router EPP, and AIMD controls how aggressively the processor feeds each endpoint. Together they provide two layers of backpressure response: Router-side admission/shedding plus processor-side concurrency adaptation. Set `aimd.enabled: false` to use fixed concurrency without adaptive behavior.
 - **`concurrency.global`**: A hard ceiling across all endpoints. When AIMD is enabled, per-endpoint limits self-regulate via backpressure, so the global limit mostly acts as a burst ceiling. Size it high enough to avoid being the first bottleneck (e.g., `perEndpoint × expected_endpoint_count × 2`).
 - **`concurrency.perEndpoint`**: Sizing depends on backend topology. For a single vLLM instance, 10–20 is reasonable. For a Router EPP pool routing to N replicas, set it higher (e.g., `20 × N`) since the pool absorbs more concurrency. With AIMD enabled, starting high is safer — AIMD backs off quickly on 429s but recovers slowly at `+additiveIncrease` per window. Starting too low means underutilizing the backend until AIMD crawls up.
@@ -319,10 +319,10 @@ processor:
 
 Only `inferencePoolName`, `inferenceObjective`, `requestQueueName` and `resultQueueName` are used per
 model in async mode; `request_timeout`, `max_retries` and the backoff settings are ignored. Shed
-responses (429/503) are re-enqueued by llm-d-async with backoff, and the per-queue dispatch gate
-decides how much to feed the gateway — for example the `prometheus-budget` gate reads the router's
-`llm_d_epp_flow_control_*` metrics as its primary source and falls back to a configured value when
-they are unavailable.
+responses (429, and 503 when the pool has no endpoints) are re-enqueued by llm-d-async with backoff,
+and the per-queue dispatch gate decides how much to feed the gateway — for example the
+`prometheus-budget` gate reads the router's `llm_d_epp_flow_control_*` metrics as its primary source
+and falls back to a configured value when they are unavailable.
 
 On ODH, these settings come from the `LLMBatchGateway` CR rather than Helm values:
 `spec.processor.dispatchMode`, `spec.processor.modelGateways.<model>.inferenceObjective` and
@@ -350,7 +350,7 @@ On ODH, these settings come from the `LLMBatchGateway` CR rather than Helm value
 
 1. Backend is fully saturated by interactive traffic.
 2. Flow control's head-of-line blocking pauses all dispatch.
-3. With the `flowControl` gate enabled, batch requests buffer in the batch band under the queue TTL and capacity limits rather than being rejected on arrival. Requests are shed when their TTL expires (HTTP 503, queue timeout) or when the band's `maxRequests`/`maxBytes` is exhausted (HTTP 429). Without the gate, saturation alone rejects them immediately.
+3. With the `flowControl` gate enabled, batch requests buffer in the batch band under the queue TTL and capacity limits rather than being rejected on arrival. Requests are shed when their TTL expires or when the band's `maxRequests`/`maxBytes` is exhausted, both as HTTP 429 while the pool has endpoints (HTTP 503 if it has none). Without the gate, saturation alone rejects them immediately.
 4. Batch Gateway receives the shed responses and retries with exponential backoff.
 5. Any batch requests already queued before saturation hit are evicted if their TTL expires; with `enableEviction: true`, queued and in-flight negative-priority requests may also be revoked to reclaim capacity for higher-priority traffic.
 6. When interactive traffic subsides and saturation drops, batch dispatch resumes.
@@ -372,7 +372,7 @@ Key metrics to watch when running batch and interactive workloads together:
 | `llm_d_epp_flow_control_queue_size` | llm-d Router | Batch band queue growing = saturation approaching; at 1.0, new batch requests are shed instead of queued |
 | `llm_d_epp_flow_control_request_queue_duration_seconds` | llm-d Router | High queue time in batch band = sustained saturation |
 | Request evictions (TTL) | llm-d Router flow control | Batch evictions = SLO deadlines being missed |
-| 503/429 response rate | Batch Gateway metrics | High 503 (queue TTL) or 429 (band capacity) rate = flow control is shedding batch |
+| 429/503 response rate | Batch Gateway metrics | 429 (queue TTL or band capacity exceeded) = flow control is shedding batch under saturation; 503 = the pool has no endpoints |
 | Batch job completion rate | Batch Gateway metrics | Should meet SLO deadlines under normal load |
 | `llm_d_epp_flow_control_requests_total` | llm-d Router | Labels `priority` and `outcome` (`Dispatched`, `Rejected`, `Evicted`, …). `{priority="-1"}` confirms batch traffic is landing in the sheddable band |
 
