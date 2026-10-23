@@ -789,7 +789,7 @@ spec:
           type: ReplacePrefixMatch
           replacePrefixMatch: /v1/completions
     backendRefs:
-    - group: inference.networking.x-k8s.io
+    - group: inference.networking.k8s.io
       kind: InferencePool
       name: ${POOL_NAME}
   - matches:
@@ -803,7 +803,7 @@ spec:
           type: ReplacePrefixMatch
           replacePrefixMatch: /v1/chat/completions
     backendRefs:
-    - group: inference.networking.x-k8s.io
+    - group: inference.networking.k8s.io
       kind: InferencePool
       name: ${POOL_NAME}
 EOF
@@ -812,6 +812,8 @@ EOF
 > **Same path pattern**: The batch-llm-route uses the same `/{namespace}/{isvc-name}/v1/*` path pattern as the auto-generated LLM route on the external Gateway. This allows the processor to use the same URL format.
 
 > **URL rewrite**: Each rule strips the `/{namespace}/{isvc-name}` prefix before forwarding to the InferencePool, matching the rewrite behavior of the auto-generated LLM route.
+
+> **InferencePool API group**: `InferencePool` was promoted to the `inference.networking.k8s.io` group (v1) by the Gateway API Inference Extension. Routes referencing the pre-promotion `inference.networking.x-k8s.io` group are accepted by the Gateway but never resolve — the route reports `ResolvedRefs=False` ("referencing unsupported backendRef") and inference requests fail — on current Gateway implementations. Use `inference.networking.k8s.io` unless your cluster predates the promotion.
 
 </details>
 
