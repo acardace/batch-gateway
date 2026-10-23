@@ -1516,6 +1516,8 @@ done
 sleep 60
 ```
 
+> **Note**: This test only produces a 429 when the TokenRateLimitPolicy from [3.8 Configure TokenRateLimitPolicy for LLMInferenceService](#38-configure-tokenratelimitpolicy-for-llminferenceservice) has been applied. On clusters with the Models as a Service (MaaS) component enabled, the pre-existing MaaS TokenRateLimitPolicies only apply to subscription-key traffic — plain Kubernetes SA-token users are not rate limited through the `openshift-ai-inference` Gateway, so without the section 3.8 policy this test completes without ever hitting 429.
+
 ### 4.5 Batch Authentication
 
 ```bash
