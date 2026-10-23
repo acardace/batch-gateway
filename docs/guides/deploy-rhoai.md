@@ -68,9 +68,9 @@ Flow control ensures interactive inference requests are always served before bat
 |---------------|----------|----------|---------------------------|
 | Interactive | 100 | Interactive requests | Dispatched first |
 | Default | 0 | Requests without an objective header | Dispatched before batch |
-| Batch | -1 (sheddable) | Batch requests | Queued: shed on TTL expiry or band capacity (429, or 503 with no endpoints). In flight: revoked with 429 when higher-priority work is blocked (only with `enableEviction: true`). Retries come from the processor (sync) or llm-d-async (async) |
+| Batch | -1 (sheddable) | Batch requests | Queued: shed on TTL expiry or band capacity (429, or 503 with no endpoints). In flight: revoked with 429 when higher-priority work is blocked (`enableEviction`, recommended on). Retries come from the processor (sync) or llm-d-async (async) |
 
-When the backend is not saturated, both interactive and batch requests are dispatched freely. When saturation reaches 1.0, head-of-line blocking pauses dispatch; interactive requests resume first, and batch requests wait in the batch band until their TTL expires or the band's capacity is exhausted.
+When the backend is not saturated, both interactive and batch requests are dispatched freely. When saturation reaches 1.0, head-of-line blocking pauses dispatch; interactive requests resume first, and batch requests wait in the batch band until their TTL expires or the band's capacity is exhausted. With `enableEviction` enabled (the recommended setting), a batch request that is already in flight is also revoked so the engine stops working on it while interactive traffic is waiting.
 
 This is configured through three components:
 
@@ -529,6 +529,7 @@ spec:
           flowControl:
             maxBytes: 4294967296
             defaultRequestTTL: 30s
+            enableEviction: true
             saturationDetector:
               pluginRef: utilization-detector
             priorityBands:
@@ -538,6 +539,7 @@ spec:
                 orderingPolicyRef: fcfs-ordering-policy
               - priority: -1
                 maxBytes: 3221225472
+                defaultRequestTTL: 120s
                 fairnessPolicyRef: global-strict-fairness-policy
                 orderingPolicyRef: slo-deadline-ordering-policy
             defaultPriorityBand:
@@ -587,7 +589,7 @@ oc wait llminferenceservice/${ISVC_NAME} -n ${LLM_NS} \
 ```
 > **Key annotation**: `security.opendatahub.io/enable-auth: "true"` enables the Gateway-level AuthPolicy that uses SubjectAccessReview to check if the user has RBAC permission to `get` the specific `LLMInferenceService` resource.
 
-> **Flow control config**: The `scheduler.config.inline` EndpointPickerConfig enables the `flowControl` feature gate with two priority bands: interactive (priority 100, round-robin fairness, FCFS ordering) and batch (priority -1, sheddable, SLO-deadline ordering). The `saturationDetector` (nested under `flowControl` since llm-d-router v0.11.0) monitors backend queue depth and KV-cache utilization to trigger head-of-line blocking when the system is saturated. An inline config replaces the platform's default EPPConfig preset rather than merging with it, so it must list every plugin it references. See [1.6 Flow Control](#16-flow-control) for details.
+> **Flow control config**: The `scheduler.config.inline` EndpointPickerConfig enables the `flowControl` feature gate with two priority bands: interactive (priority 100, round-robin fairness, FCFS ordering) and batch (priority -1, sheddable, SLO-deadline ordering, longer queue TTL). `enableEviction: true` lets the EPP revoke in-flight batch requests when interactive traffic is blocked, and the `saturationDetector` (nested under `flowControl` since llm-d-router v0.11.0) monitors backend queue depth and KV-cache utilization to trigger head-of-line blocking when the system is saturated. An inline config replaces the platform's default EPPConfig preset rather than merging with it, so it must list every plugin it references. See [1.6 Flow Control](#16-flow-control) and the [Flow Control Setup Guide](flow-control-setup.md) for details.
 </details>
 
 <details>

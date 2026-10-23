@@ -32,7 +32,7 @@ For full details, see the [llm-d Router flow-control guide](https://github.com/l
 
 **Why this works:** When the backend is not saturated, both bands dispatch freely. When saturation reaches 1.0 and head-of-line blocking activates, the priority hierarchy ensures interactive requests (priority 100) are dispatched before batch requests (priority -1). Because batch requests have negative priority, they are **sheddable**, so they yield to interactive traffic. With the `flowControl` feature gate enabled they buffer under the band's capacity limits and queue TTL instead of being rejected on arrival, and are shed when either is exhausted; without the gate they are rejected on arrival once the pool is saturated. Batch dispatch resumes as soon as saturation drops. Interactive requests without an `InferenceObjective` header default to priority 0 and are still protected, since they outrank the -1 batch band. If batch requests are queued but saturation persists, they are evicted when their TTL expires.
 
-**Why sheddable (negative priority) for batch:** With non-negative priority, batch requests would compete with interactive traffic for queue capacity. Negative priority keeps them at the bottom of the dispatch order and lets the batch processor absorb the backpressure it is already designed to handle. The processor sends a fresh `x-slo-ttft-ms` on each retry, so retried requests are re-prioritized correctly by SLO urgency when they're eventually admitted.
+**Why sheddable (negative priority) for batch:** With non-negative priority, batch requests would compete with interactive traffic for queue capacity. Negative priority keeps them at the bottom of the dispatch order and lets the batch processor absorb the backpressure it is already designed to handle. Negative priority is also what makes a request eligible for in-flight eviction, so with `enableEviction` a long batch generation does not keep holding the engine while interactive work waits. The processor sends a fresh `x-slo-ttft-ms` on each retry, so retried requests are re-prioritized correctly by SLO urgency when they're eventually admitted.
 
 **SLO-deadline ordering for batch:** The batch band uses `slo-deadline-ordering-policy`, which orders requests by their SLO deadline (`ReceivedTimestamp + x-slo-ttft-ms`), ensuring inference requests of jobs closer to their completion deadline are dispatched first. See the [Router SLO Deadline Ordering Policy](https://github.com/llm-d/llm-d-router/blob/main/pkg/epp/framework/plugins/flowcontrol/ordering/slodeadline/README.md).
 
@@ -106,10 +106,12 @@ flowControl:
   saturationDetector:
     pluginRef: utilization-detector
 
-  # Optional: revoke in-flight batch requests when a higher-priority band is blocked by
-  # saturation, instead of letting them finish and take capacity from interactive traffic.
-  # Only ever applies to priority < 0. Off by default.
-  # enableEviction: true
+  # Revoke in-flight batch requests when a higher-priority band is blocked by saturation,
+  # instead of letting them run to completion and compete for capacity with interactive
+  # traffic. Only ever applies to priority < 0, so interactive requests are never touched;
+  # revoked requests get HTTP 429 and the processor/llm-d-async retries them with backoff.
+  # Disabled by default on the router; enable it wherever batch and interactive share a pool.
+  enableEviction: true
 ```
 
 Notes on this config:
@@ -147,9 +149,14 @@ Notes on this config:
 - **`enableEviction: true`** additionally allows **in-flight**, negative-priority requests to be
   revoked when a strictly higher-priority band has queued work blocked by saturation. The victim's
   stream is terminated and the caller receives HTTP 429 with
-  `x-llm-d-request-dropped-reason: evicted`. Revocation is paced by a confirmation grace (~500ms)
-  and capped at 2 revocations per decision. It never applies to priority >= 0, and it does nothing
-  unless requests are actually reaching the ceiling (see the tuning note below).
+  `x-llm-d-request-dropped-reason: evicted`, which both the processor (sync) and llm-d-async
+  (async) retry. Revocation is paced by a confirmation grace (~500ms) and capped at 2 revocations
+  per decision. It never applies to priority >= 0, and it does nothing unless requests are actually
+  reaching the ceiling (see the tuning note below). The eviction filter and ordering policy are
+  wired by the router, so no extra plugin declaration is needed. Recommended on when batch shares
+  a pool with interactive traffic: without it, a long batch request that is already in flight keeps
+  occupying the engine while interactive requests wait, and the batch work is likely to be retried
+  anyway once saturation passes.
 - **Tuning matters more than the gate.** Saturation is compared against a per-band ceiling that
   defaults to 1.0 (`static-usage-limit-policy`), so head-of-line blocking — and therefore queueing,
   TTL shedding and eviction — only engages near saturation 1.0. With `concurrency-detector` in
@@ -424,7 +431,7 @@ retrying.
 2. Flow control's head-of-line blocking pauses all dispatch.
 3. With the `flowControl` gate enabled, batch requests buffer in the batch band under the queue TTL and capacity limits rather than being rejected on arrival. Requests are shed when their TTL expires or when the band's `maxRequests`/`maxBytes` is exhausted, both as HTTP 429 while the pool has endpoints (HTTP 503 if it has none). Without the gate, saturation alone rejects them immediately.
 4. Batch Gateway receives the shed responses and retries with exponential backoff.
-5. Queued batch requests are evicted when their TTL expires. With `enableEviction: true`, **in-flight** negative-priority requests (already dispatched, awaiting a response) can additionally be revoked mid-generation with HTTP 429 and `x-llm-d-request-dropped-reason: evicted`, so the engine stops working on work that is about to be superseded. Eviction is demand-driven: it fires only when a higher-priority band has queued items and saturation is at or above its ceiling; it never applies to priority >= 0.
+5. Queued batch requests are evicted when their TTL expires. With `enableEviction: true` (recommended), **in-flight** negative-priority requests (already dispatched, awaiting a response) can additionally be revoked mid-generation with HTTP 429 and `x-llm-d-request-dropped-reason: evicted`, so the engine stops working on work that is about to be superseded. Eviction is demand-driven: it fires only when a higher-priority band has queued items and saturation is at or above its ceiling; it never applies to priority >= 0.
 6. When interactive traffic subsides and saturation drops, batch dispatch resumes.
 
 ### Scenario 4: Batch Job Near SLO Deadline
