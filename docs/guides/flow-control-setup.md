@@ -69,9 +69,17 @@ flowControl:
   # Size according to expected peak concurrent requests.
   maxBytes: 4294967296  # 4Gi
 
-  # Fallback TTL for requests that don't specify x-slo-ttft-ms.
-  # Interactive requests without SLO headers expire after 30 seconds.
+  # Queue-wait budget while the pool has endpoints. Keep it below the caller's request
+  # timeout, or the caller gives up first and the request fails as a timeout instead of
+  # being shed with a retryable 429. Interactive traffic rarely needs to wait long;
+  # llm-d-async's default per-request timeout is 5m, so stay well under that.
   defaultRequestTTL: 30s
+
+  # Queue-wait budget while the pool has no endpoints (scale-from-zero). Size it above
+  # image pull + weight load, or the first requests to a cold pool are evicted as
+  # genuine unavailability (503). Falls back to defaultRequestTTL when unset. Raise the
+  # caller's timeout alongside it, otherwise the caller gives up first.
+  noEndpointRequestTTL: 5m
 
   priorityBands:
     # --- Interactive band: high priority, fair ---
@@ -81,8 +89,11 @@ flowControl:
       orderingPolicyRef: fcfs-ordering-policy
 
     # --- Batch band: sheddable, throughput-optimized ---
+    # Batch can afford to wait longer than interactive before being shed, as long as the
+    # per-band TTL stays under the caller's timeout (30-120s are sensible values).
     - priority: -1
       maxBytes: 3221225472  # 3Gi
+      defaultRequestTTL: 120s
       fairnessPolicyRef: global-strict-fairness-policy
       orderingPolicyRef: slo-deadline-ordering-policy
 
@@ -94,10 +105,28 @@ flowControl:
 
   saturationDetector:
     pluginRef: utilization-detector
+
+  # Optional: revoke in-flight batch requests when a higher-priority band is blocked by
+  # saturation, instead of letting them finish and take capacity from interactive traffic.
+  # Only ever applies to priority < 0. Off by default.
+  # enableEviction: true
 ```
 
 Notes on this config:
 
+- **Pick the detector before anything else.** `utilization-detector` (the default) reads the
+  model server's own KV-cache utilization and waiting queue depth, so it needs no sizing and
+  follows the engine as it changes; the thresholds above are its built-in defaults and are a
+  reasonable starting point. `concurrency-detector` instead compares in-flight requests against a
+  static `maxConcurrency` that **defaults to 100 per endpoint**; unless you set it to the engine's
+  real concurrency (e.g. vLLM `--max-num-seqs`), saturation never approaches 1.0 and flow control
+  silently does nothing. Prefer `utilization-detector` unless you need instantaneous, scrape-free
+  reaction to bursts and are prepared to keep `maxConcurrency` in sync with the deployment.
+- **Keep every TTL below the caller's timeout.** The queue TTL only sheds a request while the
+  caller is still waiting; if the client's own timeout is shorter, it gives up first and the work
+  is reported as a timeout rather than a retryable 429. llm-d-async's per-request timeout defaults
+  to 5m, so the 30s/120s budget above is safe by default. A client may ask for a shorter budget per
+  request with `x-llm-d-inference-ttl`; it cannot extend the configured TTL.
 - **`featureGates: ["flowControl"]` is required.** Flow control is off by default. Without the gate,
   everything under `flowControl:` except `saturationDetector` is ignored, with only a log warning —
   the EPP falls back to saturation-only admission.
@@ -109,7 +138,8 @@ Notes on this config:
 - **`priorityBands` is optional.** Bands are provisioned on demand from the `InferenceObjective`
   control plane. A band that is not listed inherits `defaultPriorityBand`, or the system default
   (`global-strict` fairness, `fcfs` ordering, 1Gi / 5000 requests) when no template is given. Use
-  explicit `priorityBands` when you want SLO-deadline ordering or `round-robin` fairness per band.
+  explicit `priorityBands` when you want SLO-deadline ordering, `round-robin` fairness, or a
+  per-band `defaultRequestTTL`.
 - **`saturationDetector` lives under `flowControl:`.** The top-level `saturationDetector:` field was
   removed in llm-d-router v0.11.0. If the selected detector also implements the scheduling `Filter`
   interface (e.g. `concurrency-detector`, `utilization-detector`) it is added to every scheduling
@@ -365,8 +395,10 @@ retrying.
 > (`--request-timeout`) defaults to **5 minutes** and is currently neither templated by the
 > llm-d-async chart nor exposed on the `LLMBatchGateway` CR. With a `defaultRequestTTL` above that
 > (e.g. 900s), the worker abandons the request first and records `DEADLINE_EXCEEDED` instead of
-> seeing a retryable 429 — so TTL shedding is unobservable from a batch job. Either lower
-> `defaultRequestTTL` below the worker timeout or raise the worker timeout to exceed it.
+> seeing a retryable 429 — so TTL shedding is unobservable from a batch job. The recommended
+> 30s/120s budgets above are safe with the stock worker; if you need a longer queue-wait budget,
+> raise `--request-timeout` on the async processor first (patch the chart/Deployment until it is
+> exposed) so that it still exceeds the TTL.
 
 ## How the System Behaves Under Load
 
@@ -409,7 +441,7 @@ Key metrics to watch when running batch and interactive workloads together:
 | Metric | Source | What to Watch |
 |--------|--------|---------------|
 | `llm_d_epp_flow_control_pool_saturation` | llm-d Router | Should hover below 1.0 during mixed workloads |
-| `llm_d_epp_flow_control_queue_size` | llm-d Router | Batch band queue growing = saturation approaching; at 1.0, new batch requests are shed instead of queued |
+| `llm_d_epp_flow_control_queue_size` | llm-d Router | Batch band queue growing = saturation approaching; queued batch requests are shed when their TTL expires or the band's capacity is exhausted |
 | `llm_d_epp_flow_control_request_queue_duration_seconds` | llm-d Router | High queue time in batch band = sustained saturation |
 | Request evictions (TTL) | llm-d Router flow control | Batch evictions = SLO deadlines being missed |
 | 429/503 response rate | Batch Gateway metrics | 429 (queue TTL or band capacity exceeded) = flow control is shedding batch under saturation; 503 = the pool has no endpoints |
