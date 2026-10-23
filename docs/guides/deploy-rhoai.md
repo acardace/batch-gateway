@@ -1097,6 +1097,8 @@ data:
         credentials_file: /var/run/secrets/kubernetes.io/serviceaccount/token
       static_configs:
       - targets: ['${ISVC_NAME}-epp-service.${LLM_NS}.svc.cluster.local:9090']
+        labels:
+          namespace: ${LLM_NS}
     - job_name: 'vllm'
       scheme: https
       tls_config:
@@ -1113,6 +1115,8 @@ data:
       - source_labels: [__meta_kubernetes_pod_ip]
         target_label: __address__
         replacement: '\${1}:8000'
+      - source_labels: [__meta_kubernetes_namespace]
+        target_label: namespace
       metric_relabel_configs:
       - target_label: inference_pool
         replacement: '${POOL_NAME}'
@@ -1193,7 +1197,7 @@ EOF
 oc rollout status deployment/prometheus -n ${LLM_NS} --timeout=120s
 ```
 
-> **RHOAI-specific scrape config**: EPP requires SA token auth (`authorization.credentials_file`). vLLM pods serve metrics over HTTPS with self-signed certs (`insecure_skip_verify: true`). The `metric_relabel_configs` inject the `inference_pool` label that vLLM does not emit natively.
+> **RHOAI-specific scrape config**: EPP requires SA token auth (`authorization.credentials_file`). vLLM pods serve metrics over HTTPS with self-signed certs (`insecure_skip_verify: true`). The `metric_relabel_configs` inject the `inference_pool` label that vLLM does not emit natively. Both jobs also attach the `namespace` label: the `prometheus-budget` gate builds its metric queries from `gate_params.namespace` and filters every source on it, and neither static targets nor pod-discovered targets carry the label automatically — without it, all gate metric sources fail to match and the gate silently dispatches on its fallback value.
 
 </details>
 
