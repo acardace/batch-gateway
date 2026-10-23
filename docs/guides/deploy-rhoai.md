@@ -1117,9 +1117,10 @@ data:
         replacement: '\${1}:8000'
       - source_labels: [__meta_kubernetes_namespace]
         target_label: namespace
-      metric_relabel_configs:
-      - target_label: inference_pool
-        replacement: '${POOL_NAME}'
+      - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+        regex: '(.+)'
+        target_label: inference_pool
+        replacement: '\${1}-inference-pool'
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -1197,7 +1198,7 @@ EOF
 oc rollout status deployment/prometheus -n ${LLM_NS} --timeout=120s
 ```
 
-> **RHOAI-specific scrape config**: EPP requires SA token auth (`authorization.credentials_file`). vLLM pods serve metrics over HTTPS with self-signed certs (`insecure_skip_verify: true`). The `metric_relabel_configs` inject the `inference_pool` label that vLLM does not emit natively. Both jobs also attach the `namespace` label: the `prometheus-budget` gate builds its metric queries from `gate_params.namespace` and filters every source on it, and neither static targets nor pod-discovered targets carry the label automatically — without it, all gate metric sources fail to match and the gate silently dispatches on its fallback value.
+> **RHOAI-specific scrape config**: EPP requires SA token auth (`authorization.credentials_file`). vLLM pods serve metrics over HTTPS with self-signed certs (`insecure_skip_verify: true`). The `inference_pool` label is derived per pod from the `app.kubernetes.io/name` label (`<name>-inference-pool`, the standard pool naming) — vLLM does not emit the label natively, and deriving it per pod keeps it correct when multiple models are deployed in the namespace; a static replacement only works for a single-model deployment. Both jobs also attach the `namespace` label: the `prometheus-budget` gate builds its metric queries from `gate_params.namespace` and filters every source on it, and neither static targets nor pod-discovered targets carry the label automatically — without it, all gate metric sources fail to match and the gate silently dispatches on its fallback value.
 
 </details>
 
