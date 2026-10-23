@@ -114,8 +114,21 @@ Notes on this config:
   removed in llm-d-router v0.11.0. If the selected detector also implements the scheduling `Filter`
   interface (e.g. `concurrency-detector`, `utilization-detector`) it is added to every scheduling
   profile automatically.
-- **`enableEviction: true`** additionally allows in-flight, negative-priority requests to be revoked
-  when higher-priority traffic is blocked by saturation. Off by default.
+- **`enableEviction: true`** additionally allows **in-flight**, negative-priority requests to be
+  revoked when a strictly higher-priority band has queued work blocked by saturation. The victim's
+  stream is terminated and the caller receives HTTP 429 with
+  `x-llm-d-request-dropped-reason: evicted`. Revocation is paced by a confirmation grace (~500ms)
+  and capped at 2 revocations per decision. It never applies to priority >= 0, and it does nothing
+  unless requests are actually reaching the ceiling (see the tuning note below).
+- **Tuning matters more than the gate.** Saturation is compared against a per-band ceiling that
+  defaults to 1.0 (`static-usage-limit-policy`), so head-of-line blocking — and therefore queueing,
+  TTL shedding and eviction — only engages near saturation 1.0. With `concurrency-detector` in
+  requests mode, saturation is `inflight / (endpoints x maxConcurrency)`, where `maxConcurrency`
+  defaults to **100 per endpoint**. Against a single engine that only accepts a handful of
+  concurrent sequences (e.g. vLLM `--max-num-seqs`), the default never approaches 1.0 and the
+  shed paths stay inert. Set `maxConcurrency` (or `maxTokenConcurrency` in tokens mode) to the
+  engine's real concurrency, and/or lower the ceiling with a `usageLimitPolicyPluginRef` such as
+  `priority-holdback`.
 - On ODH, the EPP config is not a standalone object: set it inline via
   `spec.router.scheduler.config.inline` on the `LLMInferenceService`. An inline config **replaces**
   the platform's default EPPConfig preset rather than merging with it, so it must also carry the
@@ -328,6 +341,33 @@ On ODH, these settings come from the `LLMBatchGateway` CR rather than Helm value
 `spec.processor.dispatchMode`, `spec.processor.modelGateways.<model>.inferenceObjective` and
 `spec.processor.asyncConfig`. Do not edit the batch-gateway Deployments or ConfigMaps directly.
 
+Returned headers from the router (`x-llm-d-request-dropped-reason`) are preserved through the queue,
+so shed causes stay distinguishable downstream: `rejected-saturated`, `rejected-ttl-expired`,
+`rejected-no-endpoints`, or `evicted`.
+
+#### Retry and timeout behavior in async mode
+
+llm-d-async classifies the router's response and retries accordingly:
+
+| Status | Category | Retried |
+|--------|----------|---------|
+| 429 (queue TTL expiry, band capacity, in-flight eviction) | `RATE_LIMIT` | Yes |
+| 5xx (including 503 with no endpoints) | `SERVER_ERROR` | Yes |
+| Other 4xx | `INVALID_REQ` | No |
+
+Retries use exponential backoff from 2s up to a 60s cap with jitter, honor the router's
+`Retry-After` when it is longer (clamped to half the remaining deadline), and stop when the
+message deadline is exhausted — at which point the request fails as `DEADLINE_EXCEEDED` rather than
+retrying.
+
+> **Keep the caller's timeout longer than the queue TTL.** A request the EPP queues can only be shed
+> by TTL if the caller is still waiting when the TTL expires. llm-d-async's per-request timeout
+> (`--request-timeout`) defaults to **5 minutes** and is currently neither templated by the
+> llm-d-async chart nor exposed on the `LLMBatchGateway` CR. With a `defaultRequestTTL` above that
+> (e.g. 900s), the worker abandons the request first and records `DEADLINE_EXCEEDED` instead of
+> seeing a retryable 429 — so TTL shedding is unobservable from a batch job. Either lower
+> `defaultRequestTTL` below the worker timeout or raise the worker timeout to exceed it.
+
 ## How the System Behaves Under Load
 
 ### Scenario 1: Backend Idle (No Interactive Traffic)
@@ -352,7 +392,7 @@ On ODH, these settings come from the `LLMBatchGateway` CR rather than Helm value
 2. Flow control's head-of-line blocking pauses all dispatch.
 3. With the `flowControl` gate enabled, batch requests buffer in the batch band under the queue TTL and capacity limits rather than being rejected on arrival. Requests are shed when their TTL expires or when the band's `maxRequests`/`maxBytes` is exhausted, both as HTTP 429 while the pool has endpoints (HTTP 503 if it has none). Without the gate, saturation alone rejects them immediately.
 4. Batch Gateway receives the shed responses and retries with exponential backoff.
-5. Any batch requests already queued before saturation hit are evicted if their TTL expires; with `enableEviction: true`, queued and in-flight negative-priority requests may also be revoked to reclaim capacity for higher-priority traffic.
+5. Queued batch requests are evicted when their TTL expires. With `enableEviction: true`, **in-flight** negative-priority requests (already dispatched, awaiting a response) can additionally be revoked mid-generation with HTTP 429 and `x-llm-d-request-dropped-reason: evicted`, so the engine stops working on work that is about to be superseded. Eviction is demand-driven: it fires only when a higher-priority band has queued items and saturation is at or above its ceiling; it never applies to priority >= 0.
 6. When interactive traffic subsides and saturation drops, batch dispatch resumes.
 
 ### Scenario 4: Batch Job Near SLO Deadline

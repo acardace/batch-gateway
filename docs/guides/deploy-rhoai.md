@@ -68,7 +68,7 @@ Flow control ensures interactive inference requests are always served before bat
 |---------------|----------|----------|---------------------------|
 | Interactive | 100 | Interactive requests | Dispatched first |
 | Default | 0 | Requests without an objective header | Dispatched before batch |
-| Batch | -1 (sheddable) | Batch requests | Buffered under the queue TTL and band capacity, then shed (429 from a saturated pool, 503 when the pool has no endpoints); processor retries with backoff |
+| Batch | -1 (sheddable) | Batch requests | Queued: shed on TTL expiry or band capacity (429, or 503 with no endpoints). In flight: revoked with 429 when higher-priority work is blocked (only with `enableEviction: true`). Retries come from the processor (sync) or llm-d-async (async) |
 
 When the backend is not saturated, both interactive and batch requests are dispatched freely. When saturation reaches 1.0, head-of-line blocking pauses dispatch; interactive requests resume first, and batch requests wait in the batch band until their TTL expires or the band's capacity is exhausted.
 
@@ -663,7 +663,7 @@ EOF
 
 > **`interactive-default` (priority 100)**: Interactive clients can optionally send `x-llm-d-inference-objective: interactive-default` to get the highest priority. Without this header, requests default to priority 0, which still outranks batch.
 
-> **`batch-sheddable` (priority -1)**: Negative priority means sheddable, so batch yields to interactive traffic. With the `flowControl` feature gate enabled, these requests buffer in the batch band and are shed with HTTP 429 when the queue TTL expires or the band's capacity fills; the batch processor handles the retries with backoff.
+> **`batch-sheddable` (priority -1)**: Negative priority means sheddable, so batch yields to interactive traffic. With the `flowControl` feature gate enabled, these requests buffer in the batch band and are shed with HTTP 429 when the queue TTL expires or the band's capacity fills; in-flight requests can also be revoked when `enableEviction` is set. llm-d-async retries 429s with backoff in async dispatch mode. See [Flow Control Setup](flow-control-setup.md) for the timeout constraints that govern whether TTL shedding is observable.
 
 </details>
 
