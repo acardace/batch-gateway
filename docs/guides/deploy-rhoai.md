@@ -1285,6 +1285,7 @@ oc wait llmbatchgateway/batch-gateway -n ${BATCH_NS} \
 ```
 
 > - The `asyncConfig` block is operator-managed: the operator deploys an `async-processor` Deployment automatically based on this configuration. You do not deploy the async-processor separately (unlike the Helm-based K8s path).
+> - **`modelGateways` keys**: A key must exactly match the `model` field in batch request bodies — the processor rejects requests for unregistered models at ingestion. It must also be a name the model server accepts: the simulated model used above takes any name, but a real vLLM deployment requires the served model ID (for example `meta-llama/Llama-3.1-8B-Instruct`), which can differ from the `LLMInferenceService` name used in gateway URL paths. Requests naming anything else pass routing but fail with a 404 from the model server.
 > - **`workerPools`**: Each worker pool has its own gate. The `local-max-concurrency` gate on `default-workers` limits concurrent in-flight requests per worker, while the `prometheus-budget` gate on the queue controls overall dispatch rate based on cluster capacity.
 
 </details>
