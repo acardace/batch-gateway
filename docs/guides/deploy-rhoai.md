@@ -1076,11 +1076,6 @@ Uses [llm-d-async](https://github.com/llm-d/llm-d-async). The async-processor us
 Deploy a minimal Prometheus instance scraping EPP and vLLM metrics. On RHOAI, the EPP endpoint requires SA token auth and vLLM pods serve metrics over HTTPS.
 
 ```bash
-# Discover the InferencePool name
-POOL_NAME=$(oc get inferencepool -n ${LLM_NS} -o json | \
-    jq -r --arg owner "${ISVC_NAME}" \
-    '.items[] | select(.metadata.ownerReferences[]?.name == $owner) | .metadata.name' | head -1)
-
 oc apply -n "${LLM_NS}" -f - <<EOF
 apiVersion: v1
 kind: ConfigMap
@@ -1210,6 +1205,11 @@ INTERNAL_GW_SVC=$(oc get svc -n openshift-ingress \
     -l "gateway.networking.k8s.io/gateway-name=batch-internal-gateway" \
     -o jsonpath='{.items[0].metadata.name}')
 MODEL_URL="http://${INTERNAL_GW_SVC}.openshift-ingress.svc.cluster.local/${LLM_NS}/${ISVC_NAME}"
+
+# Discover the InferencePool name
+POOL_NAME=$(oc get inferencepool -n ${LLM_NS} -o json | \
+    jq -r --arg owner "${ISVC_NAME}" \
+    '.items[] | select(.metadata.ownerReferences[]?.name == $owner) | .metadata.name' | head -1)
 
 oc apply -f - <<EOF
 apiVersion: batch.llm-d.ai/v1alpha1
