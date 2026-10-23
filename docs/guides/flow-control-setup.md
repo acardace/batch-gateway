@@ -30,9 +30,9 @@ For full details, see the [llm-d Router flow-control guide](https://github.com/l
 |Interactive|100|Interactive requests|round-robin|fcfs|Low latency, fair across tenants|
 |Batch|-1|Batch requests|global-strict|slo-deadline|Sheddable; maximizes throughput, dispatches by SLO urgency|
 
-**Why this works:** When the backend is not saturated, both bands dispatch freely. When saturation reaches 1.0 and head-of-line blocking activates, the priority hierarchy ensures interactive requests (priority 100) are dispatched before batch requests (priority -1). Because batch requests have negative priority, they are **sheddable** — the Router EPP rejects them immediately at admission when the system is saturated, instead of queuing them. Batch dispatch resumes as soon as saturation drops. Interactive requests without an `InferenceObjective` header default to priority 0 and are still protected, since they outrank the -1 batch band. If batch requests are queued but saturation persists, they are evicted when their TTL expires.
+**Why this works:** When the backend is not saturated, both bands dispatch freely. When saturation reaches 1.0 and head-of-line blocking activates, the priority hierarchy ensures interactive requests (priority 100) are dispatched before batch requests (priority -1). Because batch requests have negative priority, they are **sheddable**, so they yield to interactive traffic. With the `flowControl` feature gate enabled they buffer under the band's capacity limits and queue TTL and are shed when either is exhausted (HTTP 429/503); without the gate they are rejected on arrival once the pool is saturated. Batch dispatch resumes as soon as saturation drops. Interactive requests without an `InferenceObjective` header default to priority 0 and are still protected, since they outrank the -1 batch band. If batch requests are queued but saturation persists, they are evicted when their TTL expires.
 
-**Why sheddable (negative priority) for batch:** With non-negative priority, batch requests would queue inside the Router EPP during saturation — consuming queue memory and likely getting evicted by TTL anyway. Shedding rejects them early and lets the batch processor handle backoff, which it's already designed to do. The processor sends a fresh `x-slo-ttft-ms` on each retry, so retried requests are re-prioritized correctly by SLO urgency when they're eventually admitted.
+**Why sheddable (negative priority) for batch:** With non-negative priority, batch requests would compete with interactive traffic for queue capacity. Negative priority keeps them at the bottom of the dispatch order and lets the batch processor absorb the backpressure it is already designed to handle. The processor sends a fresh `x-slo-ttft-ms` on each retry, so retried requests are re-prioritized correctly by SLO urgency when they're eventually admitted.
 
 **SLO-deadline ordering for batch:** The batch band uses `slo-deadline-ordering-policy`, which orders requests by their SLO deadline (`ReceivedTimestamp + x-slo-ttft-ms`), ensuring inference requests of jobs closer to their completion deadline are dispatched first. See the [Router SLO Deadline Ordering Policy](https://github.com/llm-d/llm-d-router/blob/main/pkg/epp/framework/plugins/flowcontrol/ordering/slodeadline/README.md).
 
@@ -40,7 +40,10 @@ For full details, see the [llm-d Router flow-control guide](https://github.com/l
 
 ### EndpointPickerConfig
 
-`llm-d.ai/v1` is only available on llm-d-router main until the 1.0.0 release.
+`llm-d.ai/v1` requires llm-d-router v1.0.0 or later. On older routers use `llm-d.ai/v1alpha1`: it is
+still accepted and converted internally, but logs `DEPRECATION: apiVersion
+llm-d.ai/v1alpha1/EndpointPickerConfig is deprecated and is removed in a later release`. Decoding is
+strict, so an `apiVersion` the router does not register fails to start the EPP.
 
 ```yaml
 apiVersion: llm-d.ai/v1
@@ -93,56 +96,93 @@ flowControl:
     pluginRef: utilization-detector
 ```
 
+Notes on this config:
+
+- **`featureGates: ["flowControl"]` is required.** Flow control is off by default. Without the gate,
+  everything under `flowControl:` except `saturationDetector` is ignored, with only a log warning —
+  the EPP falls back to saturation-only admission.
+- **Every referenced plugin must be declared.** Each `fairnessPolicyRef`, `orderingPolicyRef` and
+  `saturationDetector.pluginRef` must appear in `plugins:`. Only the defaults
+  (`utilization-detector`, `fcfs-ordering-policy`, `global-strict-fairness-policy`,
+  `static-usage-limit-policy`) are registered automatically; a `saturationDetector` pointing at an
+  undeclared plugin fails validation at startup.
+- **`priorityBands` is optional.** Bands are provisioned on demand from the `InferenceObjective`
+  control plane. A band that is not listed inherits `defaultPriorityBand`, or the system default
+  (`global-strict` fairness, `fcfs` ordering, 1Gi / 5000 requests) when no template is given. Use
+  explicit `priorityBands` when you want SLO-deadline ordering or `round-robin` fairness per band.
+- **`saturationDetector` lives under `flowControl:`.** The top-level `saturationDetector:` field was
+  removed in llm-d-router v0.11.0. If the selected detector also implements the scheduling `Filter`
+  interface (e.g. `concurrency-detector`, `utilization-detector`) it is added to every scheduling
+  profile automatically.
+- **`enableEviction: true`** additionally allows in-flight, negative-priority requests to be revoked
+  when higher-priority traffic is blocked by saturation. Off by default.
+- On ODH, the EPP config is not a standalone object: set it inline via
+  `spec.router.scheduler.config.inline` on the `LLMInferenceService`. An inline config **replaces**
+  the platform's default EPPConfig preset rather than merging with it, so it must also carry the
+  default scheduling plugins and the `metrics-data-source` plugin.
+
 ### How Requests Get Assigned to Bands
 
-Flow control assigns requests to priority bands based on the `InferenceObjective` Kubernetes CRD referenced by each request. The request carries the CRD name in the `x-gateway-inference-objective` header, and the Router EPP looks up the corresponding `InferenceObjective` resource to determine the priority band.
+Flow control assigns requests to priority bands based on the `InferenceObjective` Kubernetes CRD referenced by each request. The request carries the CRD name in the `x-llm-d-inference-objective` header (`x-gateway-inference-objective` is a deprecated alias), and the Router EPP looks up the corresponding `InferenceObjective` resource to determine the priority band.
+
+> **Use the group the EPP actually watches.** When both the `llm-d.ai` and legacy
+> `inference.networking.x-k8s.io` InferenceObjective CRDs are installed, the EPP prefers `llm-d.ai`
+> and **ignores** legacy resources, logging a warning. On such a cluster, objectives created in the
+> legacy group are silently unused. The EPP ServiceAccount needs `get`/`list`/`watch` on
+> `inferenceobjectives` in whichever group is in use.
 
 **Setup:**
 
-1. Create `InferenceObjective` CRDs for each workload class. The CRD (`llm-d.ai_inferenceobjectives.yaml`) comes from llm-d-router, not GAIE:
+1. Create `InferenceObjective` CRDs for each workload class. The CRD (`llm-d.ai_inferenceobjectives.yaml`) comes from llm-d-router, not GAIE. `spec.poolRef` is a single reference, not a list:
 
 ```yaml
-apiVersion: llm-d.ai/v1
+apiVersion: llm-d.ai/v1alpha2
 kind: InferenceObjective
 metadata:
   name: interactive-default
 spec:
   priority: 100
-  poolRefs:
-    - group: inference.networking.k8s.io
-      name: <your-inference-pool>
+  poolRef:
+    group: inference.networking.k8s.io
+    name: <your-inference-pool>
 
 ---
-apiVersion: llm-d.ai/v1
+apiVersion: llm-d.ai/v1alpha2
 kind: InferenceObjective
 metadata:
   name: batch-sheddable
 spec:
   priority: -1
-  poolRefs:
-    - group: inference.networking.k8s.io
-      name: <your-inference-pool>
+  poolRef:
+    group: inference.networking.k8s.io
+    name: <your-inference-pool>
 ```
+
+On clusters that only serve the legacy CRD, use `inference.networking.x-k8s.io/v1alpha2` instead.
 
 2. Configure Batch Gateway to reference the batch objective (see [Recommended Batch Gateway Configuration](#recommended-batch-gateway-configuration) below).
 
-3. Interactive workloads can optionally send `x-gateway-inference-objective: interactive-default` to get priority 100. Without this header, requests default to priority 0, which still outranks the batch band (priority -1).
+3. Interactive workloads can optionally send `x-llm-d-inference-objective: interactive-default` to get priority 100. Without this header, requests default to priority 0, which still outranks the batch band (priority -1).
 
 ## Recommended Batch Gateway Configuration
 
 ### Headers Sent
 
-Batch Gateway sets the following flow-control headers on each inference request:
+Batch Gateway sets the following flow-control headers on each inference request. The `x-llm-d-*` names are canonical on llm-d-router v0.11.0+; the `x-gateway-*` / `x-slo-*` names below are deprecated aliases that are still accepted.
 
-- **`x-slo-ttft-ms`**: Remaining milliseconds until the batch job's SLO deadline. The Router EPP's `slo-deadline-ordering-policy` reads this header to order batch requests by urgency within the batch priority band.
-- **`x-gateway-inference-objective`**: Name of the `InferenceObjective` CRD that determines the priority band. Only sent when `inference_objective` is configured on the gateway (see below).
-- **`x-gateway-inference-fairness-id`**: Tenant identifier for per-tenant fairness within a priority band. Automatically set to the job's tenant ID when it is non-empty. The Router EPP uses this header to group requests into separate flows so that a `round-robin` fairness policy can schedule them fairly.
+- **`x-slo-ttft-ms`** (alias of `x-llm-d-slo-ttft-ms`): Remaining milliseconds until the batch job's SLO deadline. The Router EPP's `slo-deadline-ordering-policy` reads this header to order batch requests by urgency within the batch priority band. Only affects ordering when the batch band uses an SLO-based ordering policy; under the default `fcfs` ordering it is ignored.
+- **`x-gateway-inference-objective`** (alias of `x-llm-d-inference-objective`): Name of the `InferenceObjective` CRD that determines the priority band. Only sent when `inference_objective` is configured on the gateway (see below).
+- **`x-gateway-inference-fairness-id`** (alias of `x-llm-d-inference-fairness-id`): Tenant identifier for per-tenant fairness within a priority band. Set to the job's tenant ID only when `send_fairness_header` is enabled on the processor (default `false`). The Router EPP uses this header to group requests into separate flows so that a `round-robin` fairness policy can schedule them fairly.
 
 **Note:** The recommended batch band configuration above uses `global-strict` fairness, which ignores flow boundaries and maximizes throughput. The fairness header only has effect if operators switch the batch band's fairness policy to `round-robin`.
 
 ### Recommended Processor Settings
 
-The following `batch-processor` configuration settings interact with flow control:
+The following `batch-processor` configuration settings interact with flow control. They apply to
+**sync dispatch**; in async dispatch mode the retry/timeout knobs on gateway entries are not used —
+retries and backpressure are handled by llm-d-async (re-enqueue with backoff, honoring
+`Retry-After`) and dispatch rate is governed by the async gates. See
+[Async dispatch](#async-dispatch).
 
 ```yaml
 # Processor concurrency settings
@@ -255,6 +295,39 @@ processor:
         maxBackoff: "30s"
 ```
 
+### Async dispatch
+
+With async dispatch the processor writes requests to Redis and the llm-d-async workers send them
+to the gateway. The flow-control headers are stamped by the processor before the request is queued
+and travel with it, so no extra configuration is needed beyond setting `inference_objective` on the
+model entry:
+
+```yaml
+processor:
+  config:
+    dispatchMode: async
+    modelGateways:
+      "model-a":
+        inferencePoolName: "pool-a"
+        inferenceObjective: "batch-sheddable-a"
+    asyncDispatch:
+      models:
+        "model-a":
+          inferencePoolName: "pool-a"
+          inferenceObjective: "batch-sheddable-a"
+```
+
+Only `inferencePoolName`, `inferenceObjective`, `requestQueueName` and `resultQueueName` are used per
+model in async mode; `request_timeout`, `max_retries` and the backoff settings are ignored. Shed
+responses (429/503) are re-enqueued by llm-d-async with backoff, and the per-queue dispatch gate
+decides how much to feed the gateway — for example the `prometheus-budget` gate reads the router's
+`llm_d_epp_flow_control_*` metrics as its primary source and falls back to a configured value when
+they are unavailable.
+
+On ODH, these settings come from the `LLMBatchGateway` CR rather than Helm values:
+`spec.processor.dispatchMode`, `spec.processor.modelGateways.<model>.inferenceObjective` and
+`spec.processor.asyncConfig`. Do not edit the batch-gateway Deployments or ConfigMaps directly.
+
 ## How the System Behaves Under Load
 
 ### Scenario 1: Backend Idle (No Interactive Traffic)
@@ -277,9 +350,9 @@ processor:
 
 1. Backend is fully saturated by interactive traffic.
 2. Flow control's head-of-line blocking pauses all dispatch.
-3. New batch requests are shed at admission (rejected immediately) due to negative priority.
-4. Batch Gateway receives rejection errors and retries with exponential backoff.
-5. Any batch requests already queued before saturation hit are evicted if their TTL expires.
+3. With the `flowControl` gate enabled, batch requests buffer in the batch band under the queue TTL and capacity limits rather than being rejected on arrival. Requests are shed when their TTL expires (HTTP 503, queue timeout) or when the band's `maxRequests`/`maxBytes` is exhausted (HTTP 429). Without the gate, saturation alone rejects them immediately.
+4. Batch Gateway receives the shed responses and retries with exponential backoff.
+5. Any batch requests already queued before saturation hit are evicted if their TTL expires; with `enableEviction: true`, queued and in-flight negative-priority requests may also be revoked to reclaim capacity for higher-priority traffic.
 6. When interactive traffic subsides and saturation drops, batch dispatch resumes.
 
 ### Scenario 4: Batch Job Near SLO Deadline
@@ -301,13 +374,18 @@ Key metrics to watch when running batch and interactive workloads together:
 | Request evictions (TTL) | llm-d Router flow control | Batch evictions = SLO deadlines being missed |
 | 503/429 response rate | Batch Gateway metrics | High 503 (queue TTL) or 429 (band capacity) rate = flow control is shedding batch |
 | Batch job completion rate | Batch Gateway metrics | Should meet SLO deadlines under normal load |
+| `llm_d_epp_flow_control_requests_total` | llm-d Router | Labels `priority` and `outcome` (`Dispatched`, `Rejected`, `Evicted`, …). `{priority="-1"}` confirms batch traffic is landing in the sheddable band |
 
 > **Metric naming:** Router v0.8.0 and earlier used the legacy
 > `inference_extension_*` names. Router v0.9.0-v0.10.x also emits the current signals under
 > `llm_d_epp_flow_control_pool_saturation`,
 > `llm_d_epp_flow_control_queue_size`, and
 > `llm_d_epp_flow_control_request_queue_duration_seconds`. Router v0.11.0+
-> emits only the `llm_d_epp_*` names.
+> emits only the `llm_d_epp_*` names. Flow-control metrics are labelled by `priority`
+> (`pool_saturation` by `stage`: `decode`, `prefill`, `effective`).
+>
+> On ODH the EPP metrics endpoint requires ServiceAccount token authentication
+> (`authorization.credentials_file` in the Prometheus scrape config).
 
 ## Summary
 
@@ -316,7 +394,7 @@ The combination of llm-d Router flow control and Batch Gateway provides automati
 - **llm-d Router flow control** handles admission, queuing, and dispatch ordering based on priority and SLO deadlines.
 - **Batch Gateway** communicates priority via `x-gateway-inference-objective`, urgency via `x-slo-ttft-ms`, and handles backpressure via retries.
 - **Priority bands** ensure interactive traffic always takes precedence.
-- **SLO-deadline ordering** ensures the most urgent batch requests are served first within the batch band.
+- **SLO-deadline ordering**, when configured on the batch band, serves the most urgent batch requests first.
 - **Saturation detection** automatically throttles all dispatch when the backend is overloaded.
 
 The system is self-regulating: batch throughput scales up and down with available backend capacity.
