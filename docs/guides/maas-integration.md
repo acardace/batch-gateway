@@ -4,6 +4,8 @@ This guide walks through deploying batch-gateway on the [MaaS (Models-as-a-Servi
 
 batch-gateway is deployed by the [batch-gateway-operator] via the **LLMBatchGateway** custom resource — no manual Helm install of the batch-gateway chart is required. The operator renders the same chart from the CR and keeps the workloads reconciled.
 
+This guide focuses on the MaaS integration: exposing the batch API through the MaaS gateway, API-key authentication, policies, and credential pass-through to models.
+
 [MaaS]: https://github.com/opendatahub-io/models-as-a-service
 [batch-gateway-operator]: https://github.com/opendatahub-io/llm-d-batch-gateway-operator
 
@@ -12,7 +14,7 @@ batch-gateway is deployed by the [batch-gateway-operator] via the **LLMBatchGate
 - OpenShift cluster (self-managed)
 - [oc]
 - [kubectl]
-- [Helm] (for the PostgreSQL test dependency only)
+- [Helm]
 - [kustomize]
 - [jq]
 - `htpasswd` (from `httpd-tools` or `apache2-utils`)
@@ -30,8 +32,8 @@ batch-gateway is deployed by the [batch-gateway-operator] via the **LLMBatchGate
 
 MaaS provides the gateway, Istio, Kuadrant, cert-manager, and model serving infrastructure. On top of that:
 
-- The **batch-gateway-operator** (an ODH/RHOAI AI Gateway sub-component) reconciles the **LLMBatchGateway** CR and deploys the API server, processor, and garbage collector, plus the TLS certificate and the Gateway API HTTPRoute.
-- The **processor** calls models through the MaaS gateway using HTTPS, forwarding the original user's credentials.
+- The **batch-gateway-operator** (an ODH/RHOAI AI Gateway sub-component) reconciles the **LLMBatchGateway** CR and deploys the API server, processor, async-processor, and garbage collector, plus the TLS certificate and the Gateway API HTTPRoute.
+- Inference requests are dispatched asynchronously through Redis queues; the **async-processor** calls models through the MaaS gateway using HTTPS, forwarding the original user's credentials.
 
 All authentication uses **MaaS API keys** (`sk-oai-*`). Users create API keys via the MaaS API using their OpenShift token, then use API keys for both batch API and model inference requests.
 
@@ -150,19 +152,23 @@ $ kubectl create namespace llm
 $ kustomize build /tmp/maas/docs/samples/models/simulator | kubectl apply -f -
 ```
 
-Wait for the model to be ready:
+Wait for the model to be ready. The model's router creates an `InferencePool` named `<model>-inference-pool`, which the LLMBatchGateway CR references in [section 4.3](#43-create-the-llmbatchgateway-cr):
 
 ```bash
 $ kubectl rollout status deploy/facebook-opt-125m-simulated-kserve -n llm --timeout=300s
 $ oc wait llminferenceservice/facebook-opt-125m-simulated -n llm \
     --for=condition=Ready --timeout=300s
+
+$ kubectl get inferencepool -n llm
+NAME                                      AGE
+facebook-opt-125m-simulated-inference-pool   30s
 ```
 
 ## 4. Deploy Batch Gateway
 
-### 4.1 Create Namespace and Database
+### 4.1 Create Namespace and Databases
 
-The LLMBatchGateway CR does **not** provision databases: PostgreSQL (job state) and, for async dispatch only, Redis are external dependencies. This guide uses synchronous dispatch, so PostgreSQL alone is enough. For production use a managed database.
+The LLMBatchGateway CR does **not** provision databases: PostgreSQL (job state) and Redis (async dispatch queues) are external dependencies. For production use managed instances.
 
 ```bash
 $ kubectl create namespace batch-api
@@ -172,18 +178,25 @@ $ helm install postgresql bitnami/postgresql -n batch-api \
     --set auth.postgresPassword=postgres \
     --set primary.persistence.enabled=false \
     --wait --timeout 120s
-```
 
-> **Redis** is only required when `spec.processor.dispatchMode` is `async` (the operator default). The async processor dispatches through llm-d-async queues backed by Redis and requires a `redis-url` key in the credentials Secret and `spec.processor.asyncConfig`. See the operator's [async dispatch and core storage migration](https://github.com/opendatahub-io/llm-d-batch-gateway-operator/blob/main/docs/async-default-migration.md) guide. This guide sets `dispatchMode: sync` explicitly.
+# Install Redis
+$ helm repo add bitnami https://charts.bitnami.com/bitnami
+$ helm install redis bitnami/redis -n batch-api \
+    --set auth.enabled=false \
+    --set replica.replicaCount=0 \
+    --set master.persistence.enabled=false \
+    --wait --timeout 120s
+```
 
 ### 4.2 Create Secret and PVC
 
-The credentials Secret is referenced by `spec.secretRef` and mounted read-only at `/etc/.secrets/` in every batch-gateway pod — **every key of the Secret becomes a file** at `/etc/.secrets/<key>`. Required keys:
+The credentials Secret is referenced by `spec.secretRef`. Required keys:
 
 - `postgresql-url` — PostgreSQL connection URL
-- `maas-gateway-ca` — (this guide) CA certificate that signed the MaaS gateway's TLS certificate, used by the processor for inference calls
+- `redis-url` — Redis URL for the async dispatch queues
+- `maas-gateway-ca` — (this guide) CA certificate that signed the MaaS gateway's TLS certificate, used by the async-processor for inference calls
 
-The processor calls models through the MaaS gateway over HTTPS. The gateway's listener certificate is signed by the cluster's internal ingress CA, so the processor needs that CA to verify it (the LLMBatchGateway API forbids `tlsInsecureSkipVerify`). Extract the CA from the certificate chain referenced by the Gateway:
+The async-processor calls models through the MaaS gateway over HTTPS. The gateway's listener certificate is signed by the cluster's internal ingress CA, so the async-processor needs that CA to verify it (the LLMBatchGateway API forbids `insecureSkipVerify`). Extract the CA from the certificate chain referenced by the Gateway:
 
 ```bash
 # Certificate secret used by the MaaS gateway listener
@@ -199,12 +212,13 @@ $ openssl x509 -in "${MAAS_GW_CA}" -noout -subject
 subject=CN=ingress-operator@1777551671
 ```
 
-> **Note**: if the MaaS gateway uses a certificate signed by a public CA, skip the `maas-gateway-ca` key — the processor trusts system roots by default and no `tlsCACertFile` is needed.
+> **Note**: if the MaaS gateway uses a certificate signed by a public CA, skip the `maas-gateway-ca` key — the async-processor trusts system roots by default and `asyncConfig.tls` is not needed.
 
 ```bash
-# App secret with database connection URL and the gateway CA
+# App secret with database/queue URLs and the gateway CA
 $ kubectl create secret generic batch-gateway-secrets -n batch-api \
     --from-literal=postgresql-url=postgresql://postgres:postgres@postgresql.batch-api.svc.cluster.local:5432/postgres \
+    --from-literal=redis-url=redis://redis-master.batch-api.svc.cluster.local:6379/0 \
     --from-file=maas-gateway-ca="${MAAS_GW_CA}"
 
 # PVC for file storage
@@ -238,10 +252,11 @@ The CR replaces the Helm install. Everything the Helm flags used to configure is
 
 Container images are **not** set in the CR — the platform controls them through the operator deployment (see the operator's [ODH installation guide](https://github.com/opendatahub-io/llm-d-batch-gateway-operator/blob/main/docs/odh-installation.md)).
 
-`passThroughHeaders={Authorization,X-MaaS-Subscription}` ensures the API key and subscription header are forwarded to the model for authentication and rate limiting. The processor reaches the MaaS gateway via its **external hostname** (`https://maas.<cluster-domain>`) so that the certificate's SAN matches the hostname — the CRD rejects `tlsInsecureSkipVerify`, and the internal service DNS name does not match the certificate SAN.
+`passThroughHeaders={Authorization,X-MaaS-Subscription}` ensures the API key and subscription header are stored with each batch job and forwarded to the model for authentication and rate limiting. The async-processor reaches the MaaS gateway via its **external hostname** (`https://maas.<cluster-domain>`) so that the certificate's SAN matches the hostname — the internal service DNS name does not match the certificate SAN. `asyncConfig.tls` points the async-processor at the `maas-gateway-ca` key of the credentials Secret for certificate verification.
 
 ```bash
 $ CLUSTER_DOMAIN=$(kubectl get ingresses.config.openshift.io cluster -o jsonpath='{.spec.domain}')
+$ POOL_NAME=facebook-opt-125m-simulated-inference-pool
 
 $ kubectl apply -f - <<EOF
 apiVersion: batch.llm-d.ai/v1alpha1
@@ -264,18 +279,29 @@ spec:
         - Authorization
         - X-MaaS-Subscription
   processor:
-    # sync keeps direct HTTPS dispatch through the MaaS gateway with
-    # passThroughHeaders; "async" (the default) dispatches via llm-d-async
-    # queues and requires Redis + inferencePoolName instead of url.
-    dispatchMode: sync
+    dispatchMode: async
     modelGateways:
       facebook/opt-125m:
+        inferencePoolName: ${POOL_NAME}
+    asyncConfig:
+      resultPollTimeout: 30s
+      inferenceGateway:
         url: https://maas.${CLUSTER_DOMAIN}/llm/facebook-opt-125m-simulated
-        tlsCACertFile: /etc/.secrets/maas-gateway-ca
-        requestTimeout: 5m
-        maxRetries: 3
-        initialBackoff: 1s
-        maxBackoff: 60s
+      redis:
+        requestPathURL: /v1/chat/completions
+        queuesConfig:
+        - name: "llm-d-async:requests:${POOL_NAME}"
+          requestPathURL: /v1/chat/completions
+          workerPoolID: default-workers
+      workerPools:
+      - name: default-workers
+        workers: 4
+        gateType: local-max-concurrency
+        gateParams:
+          limit: "2"
+      tls:
+        secretName: batch-gateway-secrets
+        caCertKey: maas-gateway-ca
   gc: {}
   tls:
     enabled: true
@@ -294,15 +320,17 @@ spec:
 EOF
 ```
 
-Wait for the CR to become Ready (the operator deploys `<name>-apiserver`, `<name>-processor`, `<name>-gc` and reports replica counts in the CR status):
+The `asyncConfig` block above is the minimum for MaaS: the queue name follows the `llm-d-async:requests:<inferencePoolName>` convention and must match the `modelGateways` entry, and the inference gateway URL points at the model's MaaS route. See the [RHOAI deployment guide](deploy-rhoai.md) for the full dispatch configuration reference (gates, worker pools, Prometheus integration).
+
+Wait for the CR to become Ready (the operator deploys `<name>-apiserver`, `<name>-processor`, `<name>-async-processor`, `<name>-gc` and reports replica counts in the CR status):
 
 ```bash
 $ kubectl wait --for=condition=Ready llmbatchgateway/batch-gateway -n batch-api --timeout=300s
 llmbatchgateway.batch.llm-d.ai/batch-gateway condition met
 
 $ kubectl get llmbatchgateway -n batch-api
-NAMESPACE   NAME            READY   API-READY   PROC-READY   GC-READY   AGE
-batch-api   batch-gateway   True    1           1            1          90s
+NAMESPACE   NAME            READY   API-READY   PROC-READY   GC-READY   ASYNC-READY   AGE
+batch-api   batch-gateway   True    1           1            1          1            90s
 ```
 
 ### 4.4 Create DestinationRule
@@ -637,7 +665,7 @@ $ while true; do
   done
 ```
 
-The batch completing proves that `passThroughHeaders` works: the processor forwarded the API key through the MaaS gateway to the model, passing the gateway's auth policy on the model route.
+The batch completing proves that `passThroughHeaders` works: the async-processor forwarded the API key through the MaaS gateway to the model, passing the gateway's auth policy on the model route.
 
 ## 7. How passThroughHeaders Works
 
@@ -653,20 +681,24 @@ The batch completing proves that `passThroughHeaders` works: the processor forwa
 
 3. Apiserver stores Authorization and X-MaaS-Subscription headers with the batch job
 
-4. Processor dequeues the job, reads the stored headers
-   → Sends inference request to model through MaaS gateway:
+4. Processor dequeues the job, reads the stored headers,
+   and enqueues each inference request on the Redis dispatch
+   queue with the headers attached
+
+5. Async-processor pulls the request from the queue and sends it to the
+   model through the MaaS gateway, forwarding the stored headers:
    POST /llm/<model>/v1/chat/completions
    Authorization: Bearer sk-oai-xxx
    X-MaaS-Subscription: my-subscription
 
-5. MaaS gateway validates the same API key again (auth policy on model route)
+6. MaaS gateway validates the same API key again (auth policy on model route)
    → Authorino calls /internal/v1/api-keys/validate
    → Checks group membership via MaaSAuthPolicy
    → Applies token rate limit from the specified MaaSSubscription
    → Forwards to LLMInferenceService
 ```
 
-The processor authenticates to the model using the **original user's API key**, not a service account. By also forwarding `X-MaaS-Subscription`, users with multiple subscriptions can specify which subscription's token budget to use. If omitted, MaaS auto-selects the subscription (only works when the user has exactly one).
+The async-processor authenticates to the model using the **original user's API key**, not a service account. By also forwarding `X-MaaS-Subscription`, users with multiple subscriptions can specify which subscription's token budget to use. If omitted, MaaS auto-selects the subscription (only works when the user has exactly one).
 
 ## 8. Cleanup
 
@@ -677,6 +709,7 @@ $ kubectl delete ratelimitpolicy batch-ratelimit -n batch-api
 $ kubectl delete authpolicy batch-auth -n batch-api
 $ kubectl delete llmbatchgateway batch-gateway -n batch-api
 $ kubectl delete destinationrule batch-gateway-backend-tls -n openshift-ingress
+$ helm uninstall redis -n batch-api
 $ helm uninstall postgresql -n batch-api
 $ kubectl delete pvc batch-gateway-files -n batch-api
 $ kubectl delete secret batch-gateway-secrets -n batch-api
@@ -718,6 +751,7 @@ $ kubectl patch datasciencecluster default-dsc --type merge \
 | LLMBatchGateway | `batch-gateway` | User |
 | Deployment | `batch-gateway-apiserver` | Operator (from CR) |
 | StatefulSet | `batch-gateway-processor` | Operator (from CR) |
+| Deployment | `batch-gateway-async-processor` | Operator (from CR) |
 | Deployment | `batch-gateway-gc` | Operator (from CR) |
 | Certificate | `batch-gateway-apiserver-tls` | Operator (from CR, via cert-manager) |
 | HTTPRoute | `batch-gateway-apiserver` | Operator (from CR) |
@@ -731,6 +765,7 @@ $ kubectl patch datasciencecluster default-dsc --type merge \
 | Kind | Name | Created By |
 |------|------|------------|
 | LLMInferenceService | `facebook-opt-125m-simulated` | User |
+| InferencePool | `facebook-opt-125m-simulated-inference-pool` | Model router (auto) |
 | MaaSModelRef | `facebook-opt-125m-simulated` | User |
 | HTTPRoute | `facebook-opt-125m-simulated-kserve-route` | MaaS controller (auto) |
 | TokenRateLimitPolicy | `maas-trlp-facebook-opt-125m-simulated` | MaaS controller (auto) |
@@ -742,32 +777,13 @@ $ kubectl patch datasciencecluster default-dsc --type merge \
 | MaaSAuthPolicy | `batch-model-access` | User |
 | MaaSSubscription | `batch-test-subscription` | User |
 
-## 10. Operator Coverage and Automation Roadmap
-
-Managed by the LLMBatchGateway CR today (all degrade gracefully when the relevant CRDs are absent):
-
-- apiserver / processor / gc workloads, Services, ConfigMaps, ServiceAccounts
-- cert-manager `Certificate` for apiserver TLS (`spec.tls`)
-- Gateway API `HTTPRoute` with the `/v1/batches` + `/v1/files` rules (`spec.httpRoute`) — previously a manual step in this guide
-- `ServiceMonitor` / `PodMonitor` / `PrometheusRule` (`spec.monitoring`, `spec.prometheusRule`)
-- cross-namespace credentials Secret copy via `ReferenceGrant` (`spec.secretRef.namespace`)
-
-Still manual in this guide, with the operator rollout candidates (each must keep working when MaaS — or the underlying dependency — is **not** installed):
-
-1. **DestinationRule for gateway→apiserver re-encryption (4.4)** — candidate: an opt-in CR field rendering the Istio `DestinationRule` in the HTTPRoute parent's namespace, gated on the Istio CRDs being installed (same pattern the controller already uses for HTTPRoute/Certificate CRDs). Pure backend-TLS concern; no MaaS dependency.
-2. **Kuadrant AuthPolicy / RateLimitPolicy (5.2, 5.3)** — candidate: an optional CR section rendering Kuadrant policies targeting the managed HTTPRoute, gated on Kuadrant CRDs. The auth callback URL and patterns must stay user-supplied (a generic HTTP-callback, not hard-coded to maas-api), so the feature works with any identity provider and without MaaS.
-3. **CA certificate for inference gateway TLS (4.2)** — today the CA is stuffed into the credentials Secret and referenced by `tlsCACertFile`. Candidate: a `tlsCACertSecretRef` (secret name + key) on each model gateway entry that the operator mounts, decoupling gateway CAs from database credentials. Generic — works for any HTTPS inference gateway.
-4. **Selfsigned ClusterIssuer bootstrap (1)** — candidate: default `spec.tls.certManager` to a namespace-scoped selfsigned `Issuer` created by the operator when no issuer is named, avoiding the cluster-scoped manual step. Alternatively document the `Issuer` kind for namespace-scoped issuers.
-5. **Dev/test dependencies (4.1)** — PostgreSQL (and Redis for async) are external by design. Candidate for the rollout (not the reconciler): a supported OpenShift prerequisites script or bundle equivalent to the operator repo's `hack/setup-prereqs.sh` (kind), for evaluation clusters. Production stays bring-your-own.
-
-Not automation candidates: MaaS-side CRs (MaaSModelRef / MaaSAuthPolicy / MaaSSubscription), test users, and OAuth identity providers are MaaS/cluster-admin concerns — the operator must not depend on MaaS being installed.
-
-## 11. References
+## 10. References
 
 - [MaaS Platform](https://github.com/opendatahub-io/models-as-a-service)
 - [MaaS installation guide](https://opendatahub-io.github.io/models-as-a-service/)
 - [batch-gateway-operator](https://github.com/opendatahub-io/llm-d-batch-gateway-operator)
 - [Operator ODH installation guide](https://github.com/opendatahub-io/llm-d-batch-gateway-operator/blob/main/docs/odh-installation.md)
+- [RHOAI deployment guide (dispatch configuration)](deploy-rhoai.md)
 - [Kuadrant AuthPolicy](https://docs.kuadrant.io/latest/kuadrant-operator/doc/reference/authpolicy/)
 - [Kuadrant RateLimitPolicy](https://docs.kuadrant.io/latest/kuadrant-operator/doc/reference/ratelimitpolicy/)
 - [Gateway API HTTPRoute](https://gateway-api.sigs.k8s.io/api-types/httproute/)
