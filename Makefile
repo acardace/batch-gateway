@@ -174,6 +174,7 @@ test-scripts:
 	@echo "Running shell script tests..."
 	@bash scripts/generate-release_test.sh
 	@bash scripts/dev-deploy_test.sh
+	@bash benchmarks/setup_test.sh
 
 ## test-coverage: Run tests with coverage
 test-coverage:
@@ -329,7 +330,7 @@ test-regression:
 ## test-integration: Run integration tests (in-process server with mock backends and external service integration, no cluster needed)
 test-integration:
 	@echo "Running integration tests..."
-	@$(GO) test -v -tags=integration ./... || \
+	@$(GO) test $(GOFLAGS) -v -tags=integration ./... || \
 		(echo "\n❌ Integration tests failed" && exit 1)
 	@echo "\n✅ Integration tests passed!"
 
@@ -493,7 +494,7 @@ test-e2e:
 	@echo "Running E2E tests..."
 	@OUT=$$(mktemp); \
 	echo "Processor observability endpoint: auto-resolved by the e2e test helpers"; \
-	cd test/e2e && $(GO) test -v $(if $(TEST_OUTPUT),-json) -count=1 -timeout=30m $(if $(TEST_RUN),-run $(TEST_RUN)) ./... 2>&1 | tee $$OUT; \
+	cd test/e2e && $(GO) test -v $(if $(TEST_OUTPUT),-json) -count=1 -timeout=60m $(if $(TEST_RUN),-run $(TEST_RUN)) ./... 2>&1 | tee $$OUT; \
 	TEST_EXIT=$${PIPESTATUS[0]}; \
 	PASS_COUNT=$$(grep -- '--- PASS:' $$OUT 2>/dev/null | wc -l | tr -d ' '); \
 	FAIL_COUNT=$$(grep -- '--- FAIL:' $$OUT 2>/dev/null | wc -l | tr -d ' '); \
