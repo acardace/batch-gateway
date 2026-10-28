@@ -33,7 +33,9 @@ This guide focuses on the MaaS integration: exposing the batch API through the M
 MaaS provides the gateway, Istio, Kuadrant, cert-manager, and model serving infrastructure. On top of that:
 
 - The **batch-gateway-operator** (an ODH/RHOAI AI Gateway sub-component) reconciles the **LLMBatchGateway** CR and deploys the API server, processor, async-processor, and garbage collector, plus the TLS certificate and the Gateway API HTTPRoute.
-- Inference requests are dispatched asynchronously through Redis queues; the **async-processor** calls models through the MaaS gateway using HTTPS, forwarding the original user's credentials.
+- Inference requests are dispatched asynchronously through PostgreSQL-backed SQL dispatch queues (`spec.processor.asyncConfig.sql`); the **async-processor** calls models through the MaaS gateway using HTTPS, forwarding the original user's credentials.
+
+Because PostgreSQL already backs batch job state, the SQL transport keeps the deployment to a single stateful dependency — no Redis is required.
 
 All authentication uses **MaaS API keys** (`sk-oai-*`). Users create API keys via the MaaS API using their OpenShift token, then use API keys for both batch API and model inference requests.
 
@@ -168,33 +170,28 @@ facebook-opt-125m-simulated-inference-pool   30s
 
 ### 4.1 Create Namespace and Databases
 
-The LLMBatchGateway CR does **not** provision databases: PostgreSQL (job state) and Redis (async dispatch queues) are external dependencies. For production use managed instances.
+The LLMBatchGateway CR does **not** provision databases: PostgreSQL is an external dependency, backing both batch job state and — with the SQL transport used in this guide — the async request/result queues. For production use a managed instance.
 
 ```bash
 $ kubectl create namespace batch-api
 
-# Install PostgreSQL
+$ helm repo add bitnami https://charts.bitnami.com/bitnami
 $ helm install postgresql bitnami/postgresql -n batch-api \
     --set auth.postgresPassword=postgres \
     --set primary.persistence.enabled=false \
     --wait --timeout 120s
-
-# Install Redis
-$ helm repo add bitnami https://charts.bitnami.com/bitnami
-$ helm install redis bitnami/redis -n batch-api \
-    --set auth.enabled=false \
-    --set replica.replicaCount=0 \
-    --set master.persistence.enabled=false \
-    --wait --timeout 120s
 ```
+
+> **Note — Redis transport**: `asyncConfig.redis` (Redis/Valkey sorted sets, the chart default) is still supported. Only then is a Redis instance required and `redis-url` must be added to the credentials Secret.
 
 ### 4.2 Create Secret and PVC
 
 The credentials Secret is referenced by `spec.secretRef`. Required keys:
 
-- `postgresql-url` — PostgreSQL connection URL
-- `redis-url` — Redis URL for the async dispatch queues
+- `postgresql-url` — PostgreSQL connection URL, used for job state **and** the SQL dispatch queues (the async-processor reads the same key)
 - `maas-gateway-ca` — (this guide) CA certificate that signed the MaaS gateway's TLS certificate, used by the async-processor for inference calls
+
+`redis-url` is only required when using the `redis-sortedset` transport; it is omitted here.
 
 The async-processor calls models through the MaaS gateway over HTTPS. The gateway's listener certificate is signed by the cluster's internal ingress CA, so the async-processor needs that CA to verify it (the LLMBatchGateway API forbids `insecureSkipVerify`). Extract the CA from the certificate chain referenced by the Gateway:
 
@@ -215,10 +212,9 @@ subject=CN=ingress-operator@1777551671
 > **Note**: if the MaaS gateway uses a certificate signed by a public CA, skip the `maas-gateway-ca` key — the async-processor trusts system roots by default and `asyncConfig.tls` is not needed.
 
 ```bash
-# App secret with database/queue URLs and the gateway CA
+# App secret with the database URL and the gateway CA
 $ kubectl create secret generic batch-gateway-secrets -n batch-api \
     --from-literal=postgresql-url=postgresql://postgres:postgres@postgresql.batch-api.svc.cluster.local:5432/postgres \
-    --from-literal=redis-url=redis://redis-master.batch-api.svc.cluster.local:6379/0 \
     --from-file=maas-gateway-ca="${MAAS_GW_CA}"
 
 # PVC for file storage
@@ -246,6 +242,7 @@ The CR replaces the Helm install. Everything the Helm flags used to configure is
 | `global.dbClient.type` | `spec.dbBackend` |
 | `global.fileClient.*` | `spec.fileStorage.fs` / `spec.fileStorage.s3` |
 | `processor.config.modelGateways.<model>.*` | `spec.processor.modelGateways.<model>.*` |
+| `processor.config.asyncDispatch.transport` | `spec.processor.asyncConfig.sql` (this guide) or `spec.processor.asyncConfig.redis` |
 | `apiserver.config.batchAPI.passThroughHeaders` | `spec.apiServer.config.batchAPI.passThroughHeaders` |
 | `apiserver.tls.certManager.*` | `spec.tls.certManager.*` |
 | (manual HTTPRoute, see 4.5) | `spec.httpRoute.*` |
@@ -253,6 +250,8 @@ The CR replaces the Helm install. Everything the Helm flags used to configure is
 Container images are **not** set in the CR — the platform controls them through the operator deployment (see the operator's [ODH installation guide](https://github.com/opendatahub-io/llm-d-batch-gateway-operator/blob/main/docs/odh-installation.md)).
 
 `passThroughHeaders={Authorization,X-MaaS-Subscription}` ensures the API key and subscription header are stored with each batch job and forwarded to the model for authentication and rate limiting. The async-processor reaches the MaaS gateway via its **external hostname** (`https://maas.<cluster-domain>`) so that the certificate's SAN matches the hostname — the internal service DNS name does not match the certificate SAN. `asyncConfig.tls` points the async-processor at the `maas-gateway-ca` key of the credentials Secret for certificate verification.
+
+`asyncConfig.sql` selects the PostgreSQL dispatch transport. The processor and the async-processor both read the connection URL from the Secret's `postgresql-url` key, so no extra credentials are needed. `sql.maxConnections` caps the processor's SQL pool per replica (default 8) — budget `processor replicas × maxConnections` plus the async-processor's own pool against PostgreSQL `max_connections`.
 
 ```bash
 $ CLUSTER_DOMAIN=$(kubectl get ingresses.config.openshift.io cluster -o jsonpath='{.spec.domain}')
@@ -287,8 +286,8 @@ spec:
       resultPollTimeout: 30s
       inferenceGateway:
         url: https://maas.${CLUSTER_DOMAIN}/llm/facebook-opt-125m-simulated
-      redis:
-        requestPathURL: /v1/chat/completions
+      sql:
+        maxConnections: 8
         queuesConfig:
         - name: "llm-d-async:requests:${POOL_NAME}"
           requestPathURL: /v1/chat/completions
@@ -321,6 +320,8 @@ EOF
 ```
 
 The `asyncConfig` block above is the minimum for MaaS: the queue name follows the `llm-d-async:requests:<inferencePoolName>` convention and must match the `modelGateways` entry, and the inference gateway URL points at the model's MaaS route. See the [RHOAI deployment guide](deploy-rhoai.md) for the full dispatch configuration reference (gates, worker pools, Prometheus integration).
+
+> **Note — SQL result queues**: with the SQL transport the processor polls one result queue per model, and SQL result reads are destructive. Each model gateway entry must therefore resolve to its own result queue (default `llm-d-async:results:<inferencePoolName>`) and use a distinct `inferencePoolName`; setting only one of `requestQueueName` / `resultQueueName` is rejected. The SQL transport requires batch-gateway and llm-d-async images built with SQL producer support.
 
 Wait for the CR to become Ready (the operator deploys `<name>-apiserver`, `<name>-processor`, `<name>-async-processor`, `<name>-gc` and reports replica counts in the CR status):
 
@@ -682,8 +683,8 @@ The batch completing proves that `passThroughHeaders` works: the async-processor
 3. Apiserver stores Authorization and X-MaaS-Subscription headers with the batch job
 
 4. Processor dequeues the job, reads the stored headers,
-   and enqueues each inference request on the Redis dispatch
-   queue with the headers attached
+   and enqueues each inference request on the PostgreSQL
+   dispatch queue (SQL transport) with the headers attached
 
 5. Async-processor pulls the request from the queue and sends it to the
    model through the MaaS gateway, forwarding the stored headers:
@@ -709,7 +710,6 @@ $ kubectl delete ratelimitpolicy batch-ratelimit -n batch-api
 $ kubectl delete authpolicy batch-auth -n batch-api
 $ kubectl delete llmbatchgateway batch-gateway -n batch-api
 $ kubectl delete destinationrule batch-gateway-backend-tls -n openshift-ingress
-$ helm uninstall redis -n batch-api
 $ helm uninstall postgresql -n batch-api
 $ kubectl delete pvc batch-gateway-files -n batch-api
 $ kubectl delete secret batch-gateway-secrets -n batch-api
