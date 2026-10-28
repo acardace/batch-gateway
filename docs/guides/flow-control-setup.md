@@ -347,10 +347,12 @@ processor:
 
 ### Async dispatch
 
-With async dispatch the processor writes requests to Redis and the llm-d-async workers send them
-to the gateway. The flow-control headers are stamped by the processor before the request is queued
-and travel with it, so no extra configuration is needed beyond setting `inference_objective` on the
-model entry:
+With async dispatch the processor writes requests to the async dispatch queue — PostgreSQL with
+`transport: sql` (the same database as `db_client`), or Redis/Valkey sorted sets with
+`redis-sortedset` — and the llm-d-async workers send them to the gateway. The queue transport does
+not change flow control: the flow-control headers are stamped by the processor before the request is
+queued and travel with it, so no extra configuration is needed beyond setting `inference_objective`
+on the model entry:
 
 ```yaml
 processor:
@@ -361,18 +363,24 @@ processor:
         inferencePoolName: "pool-a"
         inferenceObjective: "batch-sheddable-a"
     asyncDispatch:
+      transport: sql        # or redis-sortedset
       models:
         "model-a":
           inferencePoolName: "pool-a"
           inferenceObjective: "batch-sheddable-a"
 ```
 
+The matching transport block (`asyncDispatch.sql` with `maxConnections`, or `asyncDispatch.redis`)
+and the queue names also have to be set; see the deployment guides for the full async configuration.
+
 Only `inferencePoolName`, `inferenceObjective`, `requestQueueName` and `resultQueueName` are used per
 model in async mode; `request_timeout`, `max_retries` and the backoff settings are ignored. Shed
 responses (429, and 503 when the pool has no endpoints) are re-enqueued by llm-d-async with backoff,
 and the per-queue dispatch gate decides how much to feed the gateway — for example the
 `prometheus-budget` gate reads the router's `llm_d_epp_flow_control_*` metrics as its primary source
-and falls back to a configured value when they are unavailable.
+and falls back to a configured value when they are unavailable. Redis-specific gate types (`redis`,
+`redis-leased-rate`, `redis-quota`) require the `redis-sortedset` transport; use `sql-quota` in place
+of `redis-quota` with the SQL transport.
 
 On ODH, these settings come from the `LLMBatchGateway` CR rather than Helm values:
 `spec.processor.dispatchMode`, `spec.processor.modelGateways.<model>.inferenceObjective` and
