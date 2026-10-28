@@ -16,11 +16,11 @@ This guide demonstrates how to deploy batch-gateway on external Kubernetes servi
     - **AuthPolicy** on the batch-route performs authentication only (kubernetesTokenReview, no authorization check) — unauthenticated requests are rejected with 401
     - **RateLimitPolicy** on the batch-route enforces per-user request rate limiting (e.g. 20 req/min), keyed by Kubernetes username (user or ServiceAccount) from TokenReview — excess requests are rejected with 429
     - Authenticated request is forwarded to **batch-gateway apiserver**, which stores the batch job
-3. **Processor** dequeues the batch job. In async mode it submits inference requests to the Redis request queue, and the `llm-d-async` processor dispatches them through a separate **Internal Gateway** (`batch-internal-gateway`) — a ClusterIP-only Gateway that is not externally accessible — with the user's original token. In sync mode it sends requests directly through the Internal Gateway.
+3. **Processor** dequeues the batch job and submits inference requests to the Redis request queue. The `llm-d-async` processor dispatches them through a separate **Internal Gateway** (`batch-internal-gateway`) — a ClusterIP-only Gateway that is not externally accessible — with the user's original token.
 4. The Internal Gateway matches `/{ns}/{isvc-name}/v1/*` → **batch-llm-route** (HTTPRoute)
     - **AuthPolicy** on the batch-llm-route performs authentication and authorization (SubjectAccessReview — checks if the original user can `get llminferenceservices/<name>`) — if the user lacks permission, the request is rejected with 403
     - **No TokenRateLimitPolicy** — batch inference requests are exempt from per-user token rate limits
-5. Request is routed to **InferencePool** → **EPP** (endpoint picker) → **vLLM** model server. EPP and, for async mode, the async dispatch gate use **flow control** to prioritize interactive requests over batch requests (see [1.5 Flow Control](#15-flow-control)). The response is returned directly or through the Redis result queue, depending on the dispatch mode, and the Processor adds it to the batch job's output file
+5. Request is routed to **InferencePool** → **EPP** (endpoint picker) → **vLLM** model server. EPP and the async dispatch gate use **flow control** to prioritize interactive requests over batch requests (see [1.5 Flow Control](#15-flow-control)). The response returns through the Redis result queue, and the Processor adds it to the batch job's output file
 
 ### 1.2 Authentication
 
@@ -68,7 +68,7 @@ For full details on flow control configuration, see the [Flow Control Setup Guid
 ## 2. Prerequisites
 
 - XKS cluster (Kubernetes 1.28+) with GPU nodes (or CPU nodes for simulator testing)
-- **RHAIIS installed** — follow the [rhai-on-xks-chart README](https://github.com/opendatahub-io/odh-gitops/blob/main/charts/rhai-on-xks-chart/README.md) to install RHAIIS
+- **RHAIIS installed with Batch Gateway enabled** — follow the [rhai-on-xks-chart README](https://github.com/opendatahub-io/odh-gitops/blob/main/charts/rhai-on-xks-chart/README.md) to install or upgrade RHAIIS with the values below
 - CLI tools: `kubectl`, `helm`, `curl`, `jq`
 - Pull secret at `~/pull-secret.json` (for quay.io/rhoai and registry.redhat.io images)
 - **CKS**: NVIDIA device plugin is pre-installed by CoreWeave. No additional GPU setup needed.
@@ -90,6 +90,35 @@ kubectl get pods -n redhat-ods-applications -l control-plane=llmisvc-controller-
 # Operator should be running
 kubectl get pods -n redhat-ods-operator
 ```
+
+### Enable Batch Gateway in the RHAIIS xKS chart
+
+Batch Gateway is managed by the AI Gateway operator on xKS. Add the following
+to the values used to install or upgrade `rhai-on-xks-chart`:
+
+```yaml
+components:
+  aigateway:
+    enabled: true
+    modelsAsAService:
+      gateway:
+        create: false
+    spec:
+      batchGateway:
+        managementState: Managed
+```
+
+Run the chart's normal `helm upgrade --install` command with these values and
+the required `--set-file imagePullSecret.dockerConfigJson=/path/to/auth.json`
+option. The chart configures the Batch Gateway operator's ServiceAccount to use
+the release pull secret and the AI Gateway operator deploys the Batch Gateway
+operator with the release's digest-pinned images.
+
+Do not install the Batch Gateway operator separately from the upstream
+Kustomize overlay when using this chart. The chart manages its lifecycle and
+image selection. You still need to copy `rhai-pull-secret` into each model
+workload namespace as shown in [Deploy a simulated model with
+LLMInferenceService](#deploy-a-simulated-model-with-llminferenceservice).
 
 ## 3. Installation Steps
 
@@ -488,14 +517,15 @@ RHAIIS_NS=redhat-ods-applications
 ```
 
 <details>
-<summary>Install batch-gateway operator (via kustomize)</summary>
+<summary>Verify the chart-managed batch-gateway operator</summary>
 
-Install the batch-gateway-operator directly from `opendatahub-io/llm-d-batch-gateway-operator`. The `rhoai` overlay deploys into `redhat-ods-applications` with midstream `odh-stable` images. On RHOAI (OpenShift), downstream v3.5-EA2 images are injected via the `RELATED_IMAGE_*` mechanism; without that, midstream images are used.
+After enabling `components.aigateway.spec.batchGateway.managementState: Managed`
+in the RHAIIS xKS chart, wait for the AI Gateway operator to deploy the Batch
+Gateway operator:
 
 ```bash
-kubectl apply -k "https://github.com/opendatahub-io/llm-d-batch-gateway-operator/config/overlays/rhoai?ref=main"
-
-kubectl rollout status deploy/llm-d-batch-gateway-operator -n redhat-ods-applications --timeout=120s
+kubectl rollout status deploy/llm-d-batch-gateway-operator \
+  -n redhat-ods-applications --timeout=120s
 ```
 
 Verify:
@@ -694,7 +724,7 @@ kubectl label namespace "${BATCH_NS}" llm-d.ai/gateway-route=true --overwrite
 
 </details>
 
-> **Note**: The batch gateway requires Redis, PostgreSQL, and S3-compatible object storage. If you already have these services available, skip ahead to [Create application secret](#create-application-secret) and update the connection URLs to point to your existing services.
+> **Note**: This Redis-transport example requires Redis or Valkey, PostgreSQL, and S3-compatible object storage. The Batch Gateway also supports an SQL async transport; configure that transport according to the operator version you install. If you already have the services required by your selected transport, skip ahead to [Create application secret](#create-application-secret) and update the connection URLs to point to your existing services.
 
 <details>
 <summary>Install Redis</summary>
@@ -830,88 +860,9 @@ kubectl create secret generic batch-gateway-secrets \
 
 </details>
 
-<details>
-<summary>Create LLMBatchGateway CR (sync compatibility example)</summary>
+#### 3.5.1 Async dispatch
 
-```bash
-# Get model URL from the Internal Gateway service
-INTERNAL_GW_SVC=$(kubectl get svc -n ${RHAIIS_NS} \
-    -l "gateway.networking.k8s.io/gateway-name=batch-internal-gateway" \
-    -o jsonpath='{.items[0].metadata.name}')
-MODEL_URL="http://${INTERNAL_GW_SVC}.${RHAIIS_NS}.svc.cluster.local/${LLM_NS}/${ISVC_NAME}"
-
-kubectl apply -f - <<EOF
-apiVersion: batch.llm-d.ai/v1alpha1
-kind: LLMBatchGateway
-metadata:
-  name: batch-gateway
-  namespace: ${BATCH_NS}
-spec:
-  secretRef:
-    name: batch-gateway-secrets
-  dbBackend: postgresql
-  fileStorage:
-    s3:
-      region: us-east-1
-      endpoint: http://minio.${BATCH_NS}.svc.cluster.local:9000
-      accessKeyId: ${MINIO_USER}
-      bucket: ${MINIO_BUCKET}
-      usePathStyle: true
-      autoCreateBucket: true
-  apiServer:
-    replicas: 1
-    config:
-      batchAPI:
-        passThroughHeaders:
-        - Authorization
-  processor:
-    replicas: 1
-    # Keep this existing-style example explicitly synchronous. New resources
-    # default to async; sync customers must set this field before upgrading.
-    dispatchMode: sync
-    globalInferenceGateway:
-      url: ${MODEL_URL}
-      requestTimeout: 5m
-      maxRetries: 3
-      initialBackoff: 1s
-      maxBackoff: 60s
-      inferenceObjective: batch-sheddable
-  gc:
-    interval: 30m
-  tls:
-    enabled: true
-    certManager:
-      issuerName: opendatahub-selfsigned-issuer
-      issuerKind: ClusterIssuer
-      dnsNames:
-      - batch-gateway-apiserver
-      - batch-gateway-apiserver.${BATCH_NS}.svc.cluster.local
-      - localhost
-EOF
-
-# Wait for the batch gateway to be ready
-kubectl wait llmbatchgateway/batch-gateway -n ${BATCH_NS} \
-    --for=condition=Ready --timeout=300s
-```
-
-> - **`processor.dispatchMode: sync`**: Preserves the original direct-HTTP behavior for this compatibility example. Existing sync customers should add this field before upgrading the operator CRD.
-> - **`processor.globalInferenceGateway.url`**: Points to the Internal Gateway's model endpoint. The Internal Gateway enforces AuthPolicy (model access check) but not TokenRateLimitPolicy.
-> - **`processor.globalInferenceGateway.inferenceObjective`**: The `InferenceObjective` CRD name sent as the `x-gateway-inference-objective` header. EPP uses this to assign the request to the batch priority band (priority -1, sheddable).
-> - **`tls.certManager`**: Enables TLS for the batch API server using cert-manager. In this demo the DestinationRule (see [3.6](#36-configure-httproute-and-policies-for-batch-gateway)) uses `insecureSkipVerify: true` because we use a self-signed certificate; in production, configure a trusted CA.
-> - **File storage**: This example uses S3-compatible storage (MinIO). To use a PVC instead, replace `fileStorage.s3` with:
->   ```yaml
->   fileStorage:
->     fs:
->       basePath: /tmp/batch-gateway
->       claimName: <your-pvc-name>
->   ```
->   The PVC must have `ReadWriteMany` access mode (requires NFS, CephFS, or similar).
-
-</details>
-
-#### 3.5.1 Option 2: Async dispatch
-
-The operator can deploy `llm-d-async` alongside the batch-gateway processor. In async mode, the batch processor writes requests to Redis and the async processor releases them to the Internal Gateway according to the configured dispatch gate.
+The operator deploys `llm-d-async` alongside the batch-gateway processor. The batch processor writes requests to Redis and the async processor releases them to the Internal Gateway according to the configured dispatch gate.
 
 This example uses the `prometheus-budget` gate. Prometheus must be available in the model namespace and must scrape the EPP and model-server metrics. The model-server scrape adds the `inference_pool` label because the model server does not emit it natively.
 
@@ -961,7 +912,6 @@ spec:
         - Authorization
   processor:
     replicas: 1
-    dispatchMode: async
     modelGateways:
       "${MODEL_NAME}":
         inferencePoolName: "${POOL_NAME}"
@@ -971,6 +921,8 @@ spec:
       concurrency: 8
       drainTimeout: 2m
       resultPollTimeout: 30s
+      inferenceGateway:
+        url: "${MODEL_URL}"
       prometheusURL: "${PROMETHEUS_URL}"
       prometheusCacheTTL: "0s"
       redis:
@@ -981,7 +933,6 @@ spec:
         - name: "llm-d-async:requests:${POOL_NAME}"
           workerPoolID: default-workers
           requestPathURL: /v1/chat/completions
-          igwBaseURL: "${MODEL_URL}"
           gateType: prometheus-budget
           gateParams:
             pool: "${POOL_NAME}"
@@ -1014,10 +965,9 @@ kubectl wait llmbatchgateway/batch-gateway -n ${BATCH_NS} \
 
 Async-specific configuration:
 
-- `dispatchMode: async` selects Redis-backed dispatch.
 - `modelGateways.<model>.inferencePoolName` identifies the target InferencePool.
 - `asyncConfig.redis.queuesConfig` must name the request queue consumed by the async processor.
-- `igwBaseURL` points to the ClusterIP-only Internal Gateway.
+- `asyncConfig.inferenceGateway.url` points to the ClusterIP-only Internal Gateway.
 - `prometheus-budget` controls dispatch based on available inference capacity.
 - `workerPools` limits async processor concurrency.
 
@@ -1382,7 +1332,7 @@ done
 | Namespace | Purpose |
 |-----------|---------|
 | `istio-system` | Istio control plane (istiod) — installed by RHAIIS |
-| `redhat-ods-applications` | KServe, inference-gateway, RHAIIS controllers, batch-gateway-operator — installed by RHAIIS + kustomize |
+| `redhat-ods-applications` | KServe, inference-gateway, RHAIIS controllers, and batch-gateway-operator — installed by RHAIIS |
 | `llm` (example; any user-defined namespace) | LLMInferenceService, model servers, InferencePool, EPP, InferenceObjective resources |
 | `redhat-ods-operator` | RHAI operator — installed by RHAIIS |
 | `cert-manager` | cert-manager — installed by RHAIIS |
