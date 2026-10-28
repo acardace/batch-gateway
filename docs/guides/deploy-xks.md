@@ -1,6 +1,6 @@
-# Batch Gateway on XKS with RHAIIS
+# Batch Gateway on XKS with RHAII
 
-This guide demonstrates how to deploy batch-gateway on external Kubernetes services (Azure, CoreWeave) using the **batch-gateway operator** on top of [RHAIIS](https://github.com/opendatahub-io/odh-gitops/blob/main/charts/rhai-on-xks-chart/README.md), using [Kuadrant](https://kuadrant.io/) for authentication, authorization, and rate limiting.
+This guide demonstrates how to deploy batch-gateway on external Kubernetes services (Azure, CoreWeave) using the **batch-gateway operator** on top of [RHAII](https://github.com/opendatahub-io/odh-gitops/blob/main/charts/rhai-on-xks-chart/README.md), using [Kuadrant](https://kuadrant.io/) for authentication, authorization, and rate limiting.
 
 > **Note**: The batch gateway does not depend on Kuadrant. This guide uses Kuadrant for gateway-level auth and rate limiting, but any policy engine that works with Gateway API can be used instead.
 
@@ -68,14 +68,14 @@ For full details on flow control configuration, see the [Flow Control Setup Guid
 ## 2. Prerequisites
 
 - XKS cluster (Kubernetes 1.28+) with GPU nodes (or CPU nodes for simulator testing)
-- **RHAIIS installed with Batch Gateway enabled** — follow the [rhai-on-xks-chart README](https://github.com/opendatahub-io/odh-gitops/blob/main/charts/rhai-on-xks-chart/README.md) to install or upgrade RHAIIS with the values below
+- **RHAII installed with Batch Gateway enabled** — follow the [rhai-on-xks-chart README](https://github.com/opendatahub-io/odh-gitops/blob/main/charts/rhai-on-xks-chart/README.md) to install or upgrade RHAII with the values below
 - CLI tools: `kubectl`, `helm`, `curl`, `jq`
 - Pull secret at `~/pull-secret.json` (for quay.io/rhoai and registry.redhat.io images)
 - **CKS**: NVIDIA device plugin is pre-installed by CoreWeave. No additional GPU setup needed.
 
-### Verify RHAIIS Installation
+### Verify RHAII Installation
 
-Before proceeding, confirm RHAIIS is healthy:
+Before proceeding, confirm RHAII is healthy:
 
 ```bash
 # Inference gateway should show an external IP and Programmed=True
@@ -91,18 +91,23 @@ kubectl get pods -n redhat-ods-applications -l control-plane=llmisvc-controller-
 kubectl get pods -n redhat-ods-operator
 ```
 
-### Enable Batch Gateway in the RHAIIS xKS chart
+### Enable Batch Gateway in the RHAII xKS chart
 
 Batch Gateway is managed by the AI Gateway operator on xKS. Add the following
 to the values used to install or upgrade `rhai-on-xks-chart`:
 
 ```yaml
 components:
+  kserve:
+    gateway:
+      allowedRoutes:
+        namespaces:
+          from: Selector
+          selector:
+            matchLabels:
+              llm-d.ai/gateway-route: "true"
   aigateway:
     enabled: true
-    modelsAsAService:
-      gateway:
-        create: false
     spec:
       batchGateway:
         managementState: Managed
@@ -114,11 +119,18 @@ option. The chart configures the Batch Gateway operator's ServiceAccount to use
 the release pull secret and the AI Gateway operator deploys the Batch Gateway
 operator with the release's digest-pinned images.
 
+> **Note**: `components.kserve.gateway.allowedRoutes.namespaces` is required by
+> the chart — the install fails without it. The `llm-d.ai/gateway-route` label
+> matches the namespaces labeled in [§3.2](#32-deploy-model-with-llminferenceservice)
+> and [§3.5](#35-install-batch-gateway), and the chart-level `modelsAsAService`
+> settings are not needed here because MaaS stays `Removed` (the default) for a
+> Batch-Gateway-only install.
+
 Do not install the Batch Gateway operator separately from the upstream
 Kustomize overlay when using this chart. The chart manages its lifecycle and
 image selection. You still need to copy `rhai-pull-secret` into each model
 workload namespace as shown in [Deploy a simulated model with
-LLMInferenceService](#deploy-a-simulated-model-with-llminferenceservice).
+LLMInferenceService](#32-deploy-model-with-llminferenceservice).
 
 ## 3. Installation Steps
 
@@ -128,7 +140,7 @@ LLMInferenceService](#deploy-a-simulated-model-with-llminferenceservice).
 <details>
 <summary>Patch inference-gateway to allow routes from labeled namespaces</summary>
 
-By default, the RHAIIS inference-gateway only allows HTTPRoutes from `redhat-ods-applications` (`allowedRoutes.namespaces.from: Same`). Batch-gateway needs to attach routes from the `batch-api` namespace, and model workloads live in the `llm` namespace. Use a label selector to restrict attachment to explicitly labeled namespaces only:
+By default, the RHAII inference-gateway only allows HTTPRoutes from `redhat-ods-applications` (`allowedRoutes.namespaces.from: Same`). Batch-gateway needs to attach routes from the `batch-api` namespace, and model workloads live in the `llm` namespace. Fresh installs using the values above create the gateway with a label selector already; if your gateway already exists with `from: Same`, patch it to restrict attachment to explicitly labeled namespaces only:
 
 ```bash
 # Build a patch for all listeners on the gateway
@@ -150,7 +162,7 @@ kubectl patch gateway inference-gateway -n redhat-ods-applications --type='json'
 
 > **Security**: Only namespaces with the `llm-d.ai/gateway-route: "true"` label can attach HTTPRoutes to the inference-gateway. On RHOAI (OpenShift), this patch is not needed because all batch-gateway HTTPRoutes are deployed in the same namespace as the gateway.
 
-> **Note**: If the RHAIIS cloud-manager reconciles the gateway back to `Same`, you may need to disable gateway management or use a separate gateway for batch traffic.
+> **Note**: If the RHAII cloud-manager reconciles the gateway back to `Same`, you may need to disable gateway management or use a separate gateway for batch traffic.
 
 </details>
 
@@ -211,7 +223,7 @@ make deploy-rhcl
 
 ### 3.2 Deploy model with LLMInferenceService
 
-Follow the [RHAIIS on xKS deployment guide](https://github.com/opendatahub-io/rhaii-on-xks/blob/main/docs/deploying-rhaii-helmcharts-on-xks-ea2.md) to deploy a model, or use the simulated model below for testing.
+Follow the [RHAII on xKS deployment guide](https://github.com/opendatahub-io/rhaii-on-xks/blob/main/docs/deploying-rhaii-helmcharts-on-xks-ea2.md) to deploy a model, or use the simulated model below for testing.
 
 The following example deploys a simulated model with `LLMInferenceService`.
 
@@ -220,21 +232,21 @@ The following example deploys a simulated model with `LLMInferenceService`.
 
 ```bash
 LLM_NS=llm   # any user-defined namespace; label it llm-d.ai/gateway-route=true below
-RHAIIS_NS=redhat-ods-applications
+RHAII_NS=redhat-ods-applications
 MODEL_NAME="facebook/opt-125m"
 ISVC_NAME=$(echo "${MODEL_NAME}" | tr '/' '-' | tr '[:upper:]' '[:lower:]')
 
 kubectl create namespace "${LLM_NS}" 2>/dev/null || true
 kubectl label namespace "${LLM_NS}" llm-d.ai/gateway-route=true --overwrite
 
-# RHAIIS creates rhai-pull-secret in ${RHAIIS_NS}. Copy it into ${LLM_NS} so the
+# RHAII creates rhai-pull-secret in ${RHAII_NS}. Copy it into ${LLM_NS} so the
 # storage-initializer init container (triggered by hf:// model URIs) and workload
 # pods can pull quay.io/rhoai images.
 kubectl create secret generic rhai-pull-secret \
   --namespace="${LLM_NS}" \
   --type=kubernetes.io/dockerconfigjson \
   --from-literal=.dockerconfigjson="$(
-    kubectl get secret rhai-pull-secret -n "${RHAIIS_NS}" \
+    kubectl get secret rhai-pull-secret -n "${RHAII_NS}" \
       -o jsonpath='{.data.\.dockerconfigjson}' | base64 -d
   )" \
   --dry-run=client -o yaml | kubectl apply -f -
@@ -339,7 +351,7 @@ kubectl wait llminferenceservice/${ISVC_NAME} -n ${LLM_NS} \
 
 > **Key annotation**: `security.opendatahub.io/enable-auth: "true"` enables the Gateway-level AuthPolicy that uses SubjectAccessReview to check if the user has RBAC permission to `get` the specific `LLMInferenceService` resource.
 
-> **Pull secret**: The `hf://` model URI triggers a `storage-initializer` init container that pulls `quay.io/rhoai/odh-kserve-storage-initializer-rhel9`. Copy `rhai-pull-secret` into `${LLM_NS}` before applying the CR (run the full §3.2 block in one shell so `RHAIIS_NS` and `LLM_NS` are set). Without it, pods fail with `Init:ImagePullBackOff` / `401 UNAUTHORIZED`.
+> **Pull secret**: The `hf://` model URI triggers a `storage-initializer` init container that pulls `quay.io/rhoai/odh-kserve-storage-initializer-rhel9`. Copy `rhai-pull-secret` into `${LLM_NS}` before applying the CR (run the full §3.2 block in one shell so `RHAII_NS` and `LLM_NS` are set). Without it, pods fail with `Init:ImagePullBackOff` / `401 UNAUTHORIZED`.
 
 > **Flow control config**: The `scheduler.config.inline` EndpointPickerConfig enables the `flowControl` feature gate with two priority bands: interactive (priority 100, round-robin fairness, FCFS ordering) and batch (priority -1, sheddable, SLO-deadline ordering). The `saturationDetector` monitors backend queue depth and KV-cache utilization to trigger head-of-line blocking when the system is saturated. See [1.5 Flow Control](#15-flow-control) for details.
 
@@ -413,14 +425,14 @@ Apply authentication, authorization, and token rate limiting for direct inferenc
 > **Note**: The AuthPolicy targets the inference Gateway (not HTTPRoute) because LLMInferenceService dynamically generates the HTTPRoute name.
 
 ```bash
-RHAIIS_NS=redhat-ods-applications
+RHAII_NS=redhat-ods-applications
 
 kubectl apply -f - <<EOF
 apiVersion: kuadrant.io/v1
 kind: AuthPolicy
 metadata:
   name: inference-gateway-auth
-  namespace: ${RHAIIS_NS}
+  namespace: ${RHAII_NS}
 spec:
   targetRef:
     group: gateway.networking.k8s.io
@@ -462,7 +474,7 @@ EOF
 
 kubectl wait authpolicy/inference-gateway-auth \
     --for="condition=Enforced=true" \
-    -n ${RHAIIS_NS} --timeout=180s
+    -n ${RHAII_NS} --timeout=180s
 ```
 
 </details>
@@ -478,7 +490,7 @@ apiVersion: kuadrant.io/v1alpha1
 kind: TokenRateLimitPolicy
 metadata:
   name: inference-token-limit
-  namespace: ${RHAIIS_NS}
+  namespace: ${RHAII_NS}
 spec:
   targetRef:
     group: gateway.networking.k8s.io
@@ -498,7 +510,7 @@ EOF
 # Wait for policy to be enforced
 kubectl wait tokenratelimitpolicy/inference-token-limit \
     --for="condition=Enforced=true" \
-    -n ${RHAIIS_NS} --timeout=180s
+    -n ${RHAII_NS} --timeout=180s
 ```
 
 </details>
@@ -513,14 +525,14 @@ LLM_NS=llm   # any user-defined namespace
 BATCH_NS=batch-api
 MODEL_NAME="facebook/opt-125m"
 ISVC_NAME=$(echo "${MODEL_NAME}" | tr '/' '-' | tr '[:upper:]' '[:lower:]')
-RHAIIS_NS=redhat-ods-applications
+RHAII_NS=redhat-ods-applications
 ```
 
 <details>
 <summary>Verify the chart-managed batch-gateway operator</summary>
 
 After enabling `components.aigateway.spec.batchGateway.managementState: Managed`
-in the RHAIIS xKS chart, wait for the AI Gateway operator to deploy the Batch
+in the RHAII xKS chart, wait for the AI Gateway operator to deploy the Batch
 Gateway operator:
 
 ```bash
@@ -541,7 +553,7 @@ kubectl get crd | grep llmbatchgateway               # LLMBatchGateway CRD regis
 <summary>Create Internal Gateway (ClusterIP)</summary>
 
 ```bash
-# Create a parametersRef ConfigMap to mount the RHAIIS CA bundle on the gateway's Envoy.
+# Create a parametersRef ConfigMap to mount the RHAII CA bundle on the gateway's Envoy.
 # This is needed because model workloads use TLS and the DestinationRule references
 # /var/run/secrets/rhai/ca.crt for certificate validation.
 kubectl apply -f - <<EOF
@@ -549,7 +561,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: batch-internal-gateway-config
-  namespace: ${RHAIIS_NS}
+  namespace: ${RHAII_NS}
 data:
   deployment: |
     spec:
@@ -572,7 +584,7 @@ apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
 metadata:
   name: batch-internal-gateway
-  namespace: ${RHAIIS_NS}
+  namespace: ${RHAII_NS}
   annotations:
     networking.istio.io/service-type: ClusterIP
 spec:
@@ -596,14 +608,14 @@ EOF
 
 # Wait for Gateway to be programmed
 kubectl wait --for=condition=Programmed --timeout=300s \
-    -n ${RHAIIS_NS} gateway/batch-internal-gateway
+    -n ${RHAII_NS} gateway/batch-internal-gateway
 ```
 
 > **Key annotation**: `networking.istio.io/service-type: ClusterIP` forces the Gateway's Service to be ClusterIP instead of LoadBalancer, ensuring it is not externally accessible.
 
-> **parametersRef**: The ConfigMap mounts the RHAIIS CA bundle (`rhai-ca-bundle`) into the gateway's Envoy proxy at `/var/run/secrets/rhai/ca.crt`. This is required because model workload services use TLS and the existing DestinationRule references this CA path for certificate validation.
+> **parametersRef**: The ConfigMap mounts the RHAII CA bundle (`rhai-ca-bundle`) into the gateway's Envoy proxy at `/var/run/secrets/rhai/ca.crt`. This is required because model workload services use TLS and the existing DestinationRule references this CA path for certificate validation.
 
-> **HTTP only**: The Internal Gateway uses HTTP (port 80) with no TLS listener. Since traffic is cluster-internal (processor → Internal Gateway → InferencePool), TLS to the model workload is handled by the Istio DestinationRule (originating TLS to the backend using the RHAIIS CA bundle).
+> **HTTP only**: The Internal Gateway uses HTTP (port 80) with no TLS listener. Since traffic is cluster-internal (processor → Internal Gateway → InferencePool), TLS to the model workload is handled by the Istio DestinationRule (originating TLS to the backend using the RHAII CA bundle).
 
 </details>
 
@@ -625,7 +637,7 @@ metadata:
 spec:
   parentRefs:
   - name: batch-internal-gateway
-    namespace: ${RHAIIS_NS}
+    namespace: ${RHAII_NS}
   rules:
   - matches:
     - path:
@@ -724,7 +736,7 @@ kubectl label namespace "${BATCH_NS}" llm-d.ai/gateway-route=true --overwrite
 
 </details>
 
-> **Note**: This Redis-transport example requires Redis or Valkey, PostgreSQL, and S3-compatible object storage. The Batch Gateway also supports an SQL async transport; configure that transport according to the operator version you install. If you already have the services required by your selected transport, skip ahead to [Create application secret](#create-application-secret) and update the connection URLs to point to your existing services.
+> **Note**: This Redis-transport example requires Redis or Valkey, PostgreSQL, and S3-compatible object storage. The Batch Gateway also supports an SQL async transport; configure that transport according to the operator version you install. If you already have the services required by your selected transport, skip ahead to [Create application secret](#35-install-batch-gateway) and update the connection URLs to point to your existing services.
 
 <details>
 <summary>Install Redis</summary>
@@ -874,10 +886,10 @@ model-server metrics required by the `prometheus-budget` gate:
 POOL_NAME=$(kubectl get inferencepool -n ${LLM_NS} -o json | \
     jq -r --arg owner "${ISVC_NAME}" \
     '.items[] | select(.metadata.ownerReferences[]?.name == $owner) | .metadata.name' | head -1)
-INTERNAL_GW_SVC=$(kubectl get svc -n ${RHAIIS_NS} \
+INTERNAL_GW_SVC=$(kubectl get svc -n ${RHAII_NS} \
     -l "gateway.networking.k8s.io/gateway-name=batch-internal-gateway" \
     -o jsonpath='{.items[0].metadata.name}')
-MODEL_URL="http://${INTERNAL_GW_SVC}.${RHAIIS_NS}.svc.cluster.local/${LLM_NS}/${ISVC_NAME}"
+MODEL_URL="http://${INTERNAL_GW_SVC}.${RHAII_NS}.svc.cluster.local/${LLM_NS}/${ISVC_NAME}"
 : "${PROMETHEUS_URL:?Set PROMETHEUS_URL to your Prometheus query endpoint}"
 ```
 
@@ -978,7 +990,7 @@ The operator deploys the async processor automatically. Do not install a second 
 Set the variable used throughout this section (re-set if starting a new shell):
 ```bash
 BATCH_NS=batch-api
-RHAIIS_NS=redhat-ods-applications
+RHAII_NS=redhat-ods-applications
 ```
 
 Create the batch route, and optionally the authentication policy and rate limit (requires Kuadrant):
@@ -997,7 +1009,7 @@ metadata:
 spec:
   parentRefs:
   - name: inference-gateway
-    namespace: ${RHAIIS_NS}
+    namespace: ${RHAII_NS}
   rules:
   - matches:
     - path:
@@ -1017,7 +1029,7 @@ apiVersion: networking.istio.io/v1
 kind: DestinationRule
 metadata:
   name: batch-gateway-backend-tls
-  namespace: ${RHAIIS_NS}
+  namespace: ${RHAII_NS}
 spec:
   host: batch-gateway-apiserver.${BATCH_NS}.svc.cluster.local
   trafficPolicy:
@@ -1131,19 +1143,19 @@ LLM_NS=llm   # any user-defined namespace
 BATCH_NS=batch-api
 MODEL_NAME="facebook/opt-125m"
 ISVC_NAME=$(echo "${MODEL_NAME}" | tr '/' '-' | tr '[:upper:]' '[:lower:]')
-RHAIIS_NS=redhat-ods-applications
+RHAII_NS=redhat-ods-applications
 ```
 
 ### 4.1 Setup Test Accounts
 
 ```bash
 # Get Gateway address
-GW_ADDR=$(kubectl get gateway inference-gateway -n ${RHAIIS_NS} \
+GW_ADDR=$(kubectl get gateway inference-gateway -n ${RHAII_NS} \
     -o jsonpath='{.status.addresses[0].value}')
 GW_URL="https://${GW_ADDR}"
 
 # If the gateway IP is not reachable externally, use port-forward:
-# kubectl port-forward svc/inference-gateway-istio -n ${RHAIIS_NS} 8443:443 &
+# kubectl port-forward svc/inference-gateway-istio -n ${RHAII_NS} 8443:443 &
 # GW_URL="https://localhost:8443"
 
 # Create authorized SA with RBAC to access the LLMInferenceService
@@ -1331,11 +1343,11 @@ done
 
 | Namespace | Purpose |
 |-----------|---------|
-| `istio-system` | Istio control plane (istiod) — installed by RHAIIS |
-| `redhat-ods-applications` | KServe, inference-gateway, RHAIIS controllers, and batch-gateway-operator — installed by RHAIIS |
+| `istio-system` | Istio control plane (istiod) — installed by RHAII |
+| `redhat-ods-applications` | KServe, inference-gateway, RHAII controllers, and batch-gateway-operator — installed by RHAII |
 | `llm` (example; any user-defined namespace) | LLMInferenceService, model servers, InferencePool, EPP, InferenceObjective resources |
-| `redhat-ods-operator` | RHAI operator — installed by RHAIIS |
-| `cert-manager` | cert-manager — installed by RHAIIS |
+| `redhat-ods-operator` | RHAI operator — installed by RHAII |
+| `cert-manager` | cert-manager — installed by RHAII |
 | `kuadrant-system` | Kuadrant operator, Authorino, Limitador |
 | `batch-api` | batch-gateway (apiserver + processor + gc), Redis, PostgreSQL |
 
@@ -1350,7 +1362,7 @@ This section documents AKS platform differences.
 Gateway Services on AKS provision an Azure Load Balancer. For internal-only clusters, annotate the relevant Service:
 
 ```bash
-kubectl annotate svc inference-gateway-istio -n ${RHAIIS_NS} \
+kubectl annotate svc inference-gateway-istio -n ${RHAII_NS} \
   service.beta.kubernetes.io/azure-load-balancer-internal=true --overwrite
 ```
 
@@ -1492,7 +1504,7 @@ Enable [Azure Monitor managed service for Prometheus](https://learn.microsoft.co
 
 - **Storage**: CoreWeave provides `shared-vast` with ReadWriteMany — no Azure Files setup needed for filesystem storage mode
 - **NVIDIA device plugin**: Pre-installed by CoreWeave, no additional GPU setup
-- **PKI naming**: The RHAIIS helmfile creates certificates with `opendatahub-*` names, while the rhai-on-xks-chart expects `rhai-*` names. On shared clusters, you may need both sets of PKI resources
+- **PKI naming**: The RHAII helmfile creates certificates with `opendatahub-*` names, while the rhai-on-xks-chart expects `rhai-*` names. On shared clusters, you may need both sets of PKI resources
 - **Monitoring CRDs**: CKS clusters do not ship Prometheus Operator CRDs by default. If components fail on missing PodMonitor/ServiceMonitor resources:
 
 ```bash
@@ -1506,7 +1518,7 @@ kubectl apply --server-side -f \
 
 | Symptom | Cause | Resolution |
 |---------|-------|------------|
-| RHAIIS pods `ImagePullBackOff` | Pull secret missing registry credentials | Check `~/pull-secret.json` covers all registries (see [rhai-on-xks-chart README](https://github.com/opendatahub-io/odh-gitops/blob/main/charts/rhai-on-xks-chart/README.md)) |
+| RHAII pods `ImagePullBackOff` | Pull secret missing registry credentials | Check `~/pull-secret.json` covers all registries (see [rhai-on-xks-chart README](https://github.com/opendatahub-io/odh-gitops/blob/main/charts/rhai-on-xks-chart/README.md)) |
 | Model pods `Init:ImagePullBackOff` in `llm` | `rhai-pull-secret` not copied into model namespace | Copy secret from `redhat-ods-applications` before applying the CR (see [§3.2](#32-deploy-model-with-llminferenceservice)); delete pods to retry |
 | `inference-gateway` not Programmed | Istio not ready | `kubectl get pods -n istio-system` and check Sail Operator |
 | `LLMInferenceService` stuck | Controller not ready or missing CRDs | `kubectl logs -n redhat-ods-applications -l app=llmisvc-controller-manager` |
@@ -1522,6 +1534,6 @@ kubectl apply --server-side -f \
 | Batch requests return 403 | User lacks RBAC on `llminferenceservices` | Create Role/RoleBinding for `get llminferenceservices/<isvc-name>` |
 | Curl returns 000 (timeout) | External IP not routable from workstation | Port-forward: `kubectl port-forward svc/inference-gateway-istio -n redhat-ods-applications 8443:443` |
 | TokenRateLimitPolicy not Enforced | No HTTPRoutes attached to target gateway | Create HTTPRoute first, policy enforces automatically |
-| RateLimitPolicy `Enforced=True` but no 429 | Wasm-shim cannot resolve `auth.identity` for rate limit counters (check gateway logs for `NoSuchKey("identity")`); ratelimit `failureMode: allow` passes traffic through | Add `response.success.filters.identity` to the AuthPolicy (see [§3.4](#34-configure-authpolicy-and-tokenratelimitpolicy-for-inference-gateway)) and use `auth.identity.username` (not `auth.identity.user.username`) in RateLimitPolicy/TokenRateLimitPolicy counters |
+| RateLimitPolicy `Enforced=True` but no 429 | Wasm-shim cannot resolve `auth.identity` for rate limit counters (check gateway logs for `NoSuchKey("identity")`); ratelimit `failureMode: allow` passes traffic through | Add `response.success.filters.identity` to the AuthPolicy (see [§3.4](#34-configure-authpolicy-and-tokenratelimitpolicy-for-inference-gateway-optional--requires-kuadrant)) and use `auth.identity.username` (not `auth.identity.user.username`) in RateLimitPolicy/TokenRateLimitPolicy counters |
 | EPP pods CrashLoopBackOff | Missing `llm-d.ai` RBAC (CKS) | Apply Role/RoleBinding fix (see after step 3.6) |
 | CRD field manager conflict | Pre-existing CRDs on shared cluster | `kubectl apply --server-side --force-conflicts` |
