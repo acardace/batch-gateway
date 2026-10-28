@@ -17,7 +17,7 @@ This guide demonstrates how to deploy batch-gateway on OpenShift with RHOAI (Red
 | `kuadrant-system` | Kuadrant operator, Authorino, Limitador |
 | `redhat-ods-operator` | RHOAI operator |
 | `redhat-ods-applications` | RHOAI controllers (KServe, model controller) |
-| `batch-api` | batch-gateway (apiserver + processor), Redis, PostgreSQL |
+| `batch-api` | batch-gateway (apiserver + processor), PostgreSQL, MinIO |
 | `llm` | LLMInferenceService, model servers, InferencePool, EPP, InferenceObjective CRDs |
 
 ### 1.2 Data Flow
@@ -865,7 +865,7 @@ EOF
 
 </details>
 
-Deploy batch-gateway dependencies (Redis, PostgreSQL, MinIO) and create the application secret:
+Deploy batch-gateway dependencies (PostgreSQL, MinIO) and create the application secret:
 
 <details>
 <summary>Create namespace and install dependencies</summary>
@@ -874,23 +874,7 @@ Deploy batch-gateway dependencies (Redis, PostgreSQL, MinIO) and create the appl
 oc create namespace "${BATCH_NS}" 2>/dev/null || true
 oc label namespace "${BATCH_NS}" llm-d.ai/gateway-route=true --overwrite
 
-# Install Redis (or Valkey — see alternative below)
-helm upgrade --install redis oci://registry-1.docker.io/bitnamicharts/redis \
-    --namespace ${BATCH_NS} --create-namespace \
-    --set architecture=standalone \
-    --set auth.enabled=false
-oc rollout status statefulset/redis-master -n ${BATCH_NS} --timeout=120s
-
-# Alternative: Install Valkey (wire-protocol compatible with Redis)
-# helm upgrade --install redis oci://registry-1.docker.io/bitnamicharts/valkey \
-#     --namespace ${BATCH_NS} --create-namespace \
-#     --set architecture=standalone \
-#     --set auth.enabled=false
-# oc rollout status statefulset/redis-valkey-primary -n ${BATCH_NS} --timeout=120s
-# Note: when using Valkey, update the redis-url secret below to use:
-#   redis://redis-valkey-primary.${BATCH_NS}.svc.cluster.local:6379/0
-
-# Install PostgreSQL
+# Install PostgreSQL (batch job state and the async SQL dispatch queues)
 PG_PASSWORD="<your-password>"   # set once, referenced below
 helm upgrade --install postgresql oci://registry-1.docker.io/bitnamicharts/postgresql \
     --namespace ${BATCH_NS} --create-namespace \
@@ -968,13 +952,12 @@ oc rollout status deployment/minio -n ${BATCH_NS} --timeout=180s
 # Create application secret
 oc create secret generic batch-gateway-secrets \
     --namespace ${BATCH_NS} \
-    --from-literal=redis-url="redis://redis-master.${BATCH_NS}.svc.cluster.local:6379/0" \
     --from-literal=postgresql-url="postgresql://postgres:${PG_PASSWORD}@postgresql.${BATCH_NS}.svc.cluster.local:5432/batch?sslmode=disable" \
     --from-literal=s3-secret-access-key="${MINIO_PASSWORD}" \
     --dry-run=client -o yaml | oc apply -f -
 ```
 
-> **Note**: Redis auth is disabled for demo purposes. For production, enable Redis authentication.
+> **Note**: `redis-url` is only required by the `redis-sortedset` async transport (see [3.10.2](#3102-option-2-async-dispatch)); the SQL transport used there reuses `postgresql-url`, so this guide needs no Redis instance.
 
 </details>
 
@@ -1065,8 +1048,8 @@ oc wait llmbatchgateway/batch-gateway -n ${BATCH_NS} \
 
 Uses [llm-d-async](https://github.com/llm-d/llm-d-async). The async-processor uses a dispatch gate to control when requests are sent to the model server. This example uses the `prometheus-budget` gate, which requires Prometheus scraping EPP and vLLM metrics. See [llm-d-async dispatch gates](https://github.com/llm-d/llm-d-async#per-queue-dispatch-gates) for other gate types.
 
-> - **`dispatchMode: async`** + **`inferencePoolName`**: The processor sends requests to Redis queues instead of making direct HTTP calls. This replaces `modelGateways.<model>.url`/`requestTimeout`/`maxRetries`/etc.
-> - **`asyncConfig`**: The operator deploys an async-processor component automatically. The `asyncConfig` block configures Redis queues, worker pools, Prometheus URL, and dispatch gates.
+> - **`dispatchMode: async`** + **`inferencePoolName`**: The processor sends requests to the async dispatch queues instead of making direct HTTP calls. This replaces `modelGateways.<model>.url`/`requestTimeout`/`maxRetries`/etc.
+> - **`asyncConfig`**: The operator deploys an async-processor component automatically. The `asyncConfig` block selects the queue transport (`sql` below, or `redis`), and configures the queues, worker pools, Prometheus URL, and dispatch gates. The SQL transport reuses the Secret's `postgresql-url`, so no extra dependency is needed.
 > - **`igwBaseURL`**: The async-processor sends inference requests through the Internal Gateway (same path as sync). Pass-through headers (including Authorization) are forwarded, so AuthPolicy works.
 > - **`gate_type: prometheus-budget`**: Computes a dispatch budget from EPP flow control metrics (primary) with vLLM metrics fallback. Requires `prometheusURL` and `gate_params.pool`.
 
@@ -1245,8 +1228,8 @@ spec:
       resultPollTimeout: 30s
       prometheusURL: http://prometheus.${LLM_NS}.svc.cluster.local:9090
       prometheusCacheTTL: "0s"
-      redis:
-        requestPathURL: /v1/chat/completions
+      sql:
+        maxConnections: 8
         pollIntervalMs: 500
         batchSize: 10
         queuesConfig:
@@ -1287,6 +1270,7 @@ oc wait llmbatchgateway/batch-gateway -n ${BATCH_NS} \
 > - The `asyncConfig` block is operator-managed: the operator deploys an `async-processor` Deployment automatically based on this configuration. You do not deploy the async-processor separately (unlike the Helm-based K8s path).
 > - **`modelGateways` keys**: A key must exactly match the `model` field in batch request bodies — the processor rejects requests for unregistered models at ingestion. It must also be a name the model server accepts: the simulated model used above takes any name, but a real vLLM deployment requires the served model ID (for example `meta-llama/Llama-3.1-8B-Instruct`), which can differ from the `LLMInferenceService` name used in gateway URL paths. Requests naming anything else pass routing but fail with a 404 from the model server.
 > - **`workerPools`**: Each worker pool has its own gate. The `local-max-concurrency` gate on `default-workers` limits concurrent in-flight requests per worker, while the `prometheus-budget` gate on the queue controls overall dispatch rate based on cluster capacity.
+> - **`asyncConfig.sql`**: The PostgreSQL dispatch transport. The processor and the async-processor both use the Secret's `postgresql-url`. `maxConnections` caps the processor's SQL pool per replica (default 8) — budget `processor replicas × maxConnections` plus the async-processor's own pool against PostgreSQL `max_connections`. With SQL, each model gateway entry must resolve to its own result queue (default `llm-d-async:results:<inferencePoolName>`) and use a distinct `inferencePoolName`, because results are read destructively per model. For a cluster that already runs Redis or Valkey, replace this block with `asyncConfig.redis` (`requestPathURL`, `pollIntervalMs`, `batchSize`, `queuesConfig`) and add `redis-url` to the Secret.
 
 </details>
 
