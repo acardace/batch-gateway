@@ -84,6 +84,7 @@ For full details on flow control configuration, see the [Flow Control Setup Guid
 - OpenShift cluster 4.20 or later (required for Distributed Inference with llm-d).
 - OpenShift Service Mesh v2 is not installed in the cluster.
 - CLI tools: `oc`, `helm`, `curl`, `jq`.
+- An `aigateway` operator bundle whose BatchGateway CRD includes the PostgreSQL async transport — i.e. one pinned to an operator commit at or after [llm-d-batch-gateway-operator#124](https://github.com/opendatahub-io/llm-d-batch-gateway-operator/pull/124). [3.10](#310-install-batch-gateway) verifies this on the cluster; a bundle without it needs the Redis/Valkey transport instead.
 
 
 ## 3. Installation Steps
