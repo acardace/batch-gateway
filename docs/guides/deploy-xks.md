@@ -16,11 +16,11 @@ This guide demonstrates how to deploy batch-gateway on external Kubernetes servi
     - **AuthPolicy** on the batch-route performs authentication only (kubernetesTokenReview, no authorization check) — unauthenticated requests are rejected with 401
     - **RateLimitPolicy** on the batch-route enforces per-user request rate limiting (e.g. 20 req/min), keyed by Kubernetes username (user or ServiceAccount) from TokenReview — excess requests are rejected with 429
     - Authenticated request is forwarded to **batch-gateway apiserver**, which stores the batch job
-3. **Processor** dequeues the batch job and submits inference requests to the Redis request queue. The `llm-d-async` processor dispatches them through a separate **Internal Gateway** (`batch-internal-gateway`) — a ClusterIP-only Gateway that is not externally accessible — with the user's original token.
+3. **Processor** dequeues the batch job and submits inference requests to the PostgreSQL-backed SQL request queue. The `llm-d-async` processor dispatches them through a separate **Internal Gateway** (`batch-internal-gateway`) — a ClusterIP-only Gateway that is not externally accessible — with the user's original token.
 4. The Internal Gateway matches `/{ns}/{isvc-name}/v1/*` → **batch-llm-route** (HTTPRoute)
     - **AuthPolicy** on the batch-llm-route performs authentication and authorization (SubjectAccessReview — checks if the original user can `get llminferenceservices/<name>`) — if the user lacks permission, the request is rejected with 403
     - **No TokenRateLimitPolicy** — batch inference requests are exempt from per-user token rate limits
-5. Request is routed to **InferencePool** → **EPP** (endpoint picker) → **vLLM** model server. EPP and the async dispatch gate use **flow control** to prioritize interactive requests over batch requests (see [1.5 Flow Control](#15-flow-control)). The response returns through the Redis result queue, and the Processor adds it to the batch job's output file
+5. Request is routed to **InferencePool** → **EPP** (endpoint picker) → **vLLM** model server. EPP and the async dispatch gate use **flow control** to prioritize interactive requests over batch requests (see [1.5 Flow Control](#15-flow-control)). The response returns through the PostgreSQL-backed SQL result queue, and the Processor adds it to the batch job's output file
 
 ### 1.2 Authentication
 
@@ -736,38 +736,12 @@ kubectl label namespace "${BATCH_NS}" llm-d.ai/gateway-route=true --overwrite
 
 </details>
 
-> **Note**: This Redis-transport example requires Redis or Valkey, PostgreSQL, and S3-compatible object storage. The Batch Gateway also supports an SQL async transport; configure that transport according to the operator version you install. If you already have the services required by your selected transport, skip ahead to [Create application secret](#35-install-batch-gateway) and update the connection URLs to point to your existing services.
+> **Note**: This SQL-transport example requires PostgreSQL and S3-compatible object storage. Redis/Valkey remains supported as an alternative async transport; if you select it, configure `asyncConfig.redis` and add the `redis-url` Secret key instead.
+>
+> **Development-only PostgreSQL:** The Bitnami example below does not configure PostgreSQL TLS and uses `sslmode=disable` for an in-cluster smoke test. Production deployments must use customer-managed PostgreSQL with TLS, protected credentials, backups, persistence, and HA. Replace the URL with the provider's TLS-verified connection string; do not copy `sslmode=disable`. The operator CR does not configure a database CA, so use the PostgreSQL client's supported trust mechanism.
 
 <details>
-<summary>Install Redis</summary>
-
-```bash
-helm upgrade --install redis oci://registry-1.docker.io/bitnamicharts/redis \
-    --namespace ${BATCH_NS} --create-namespace \
-    --version 27.0.14 \
-    --set architecture=standalone \
-    --set auth.enabled=false
-kubectl rollout status statefulset/redis-master -n ${BATCH_NS} --timeout=120s
-```
-
-> **Alternative**: You can install [Valkey](https://valkey.io/) (wire-protocol compatible with Redis) instead:
->
-> ```bash
-> helm upgrade --install redis oci://registry-1.docker.io/bitnamicharts/valkey \
->     --namespace ${BATCH_NS} --create-namespace \
->     --set architecture=standalone \
->     --set auth.enabled=false
-> kubectl rollout status statefulset/redis-valkey-primary -n ${BATCH_NS} --timeout=120s
-> ```
->
-> When using Valkey, update the `redis-url` in the secret below to: `redis://redis-valkey-primary.${BATCH_NS}.svc.cluster.local:6379/0`
-
-> **Note**: Redis auth is disabled for demo purposes. For production, enable Redis authentication.
-
-</details>
-
-<details>
-<summary>Install PostgreSQL</summary>
+<summary>Install development PostgreSQL</summary>
 
 ```bash
 PG_PASSWORD="<your-password>"   # set once, referenced below
@@ -862,19 +836,18 @@ kubectl rollout status deployment/minio -n ${BATCH_NS} --timeout=180s
 ```bash
 kubectl create secret generic batch-gateway-secrets \
     --namespace ${BATCH_NS} \
-    --from-literal=redis-url="redis://redis-master.${BATCH_NS}.svc.cluster.local:6379/0" \
     --from-literal=postgresql-url="postgresql://postgres:${PG_PASSWORD}@postgresql.${BATCH_NS}.svc.cluster.local:5432/batch?sslmode=disable" \
     --from-literal=s3-secret-access-key="${MINIO_PASSWORD}" \
     --dry-run=client -o yaml | kubectl apply -f -
 ```
 
-> Update the connection URLs above if you are using existing Redis, PostgreSQL, or S3 services.
+> Update the connection URLs above if you are using existing PostgreSQL or S3 services.
 
 </details>
 
 #### 3.5.1 Async dispatch
 
-The operator deploys `llm-d-async` alongside the batch-gateway processor. The batch processor writes requests to Redis and the async processor releases them to the Internal Gateway according to the configured dispatch gate.
+The operator deploys `llm-d-async` alongside the batch-gateway processor. The batch processor writes requests to PostgreSQL and the async processor releases them to the Internal Gateway according to the configured dispatch gate.
 
 This example uses the `prometheus-budget` gate. Prometheus must be available in the model namespace and must scrape the EPP and model-server metrics. The model-server scrape adds the `inference_pool` label because the model server does not emit it natively.
 
@@ -937,8 +910,8 @@ spec:
         url: "${MODEL_URL}"
       prometheusURL: "${PROMETHEUS_URL}"
       prometheusCacheTTL: "0s"
-      redis:
-        requestPathURL: /v1/chat/completions
+      sql:
+        maxConnections: 8
         pollIntervalMs: 500
         batchSize: 10
         queuesConfig:
@@ -978,7 +951,7 @@ kubectl wait llmbatchgateway/batch-gateway -n ${BATCH_NS} \
 Async-specific configuration:
 
 - `modelGateways.<model>.inferencePoolName` identifies the target InferencePool.
-- `asyncConfig.redis.queuesConfig` must name the request queue consumed by the async processor.
+- `asyncConfig.sql.queuesConfig` must name the request queue consumed by the async processor.
 - `asyncConfig.inferenceGateway.url` points to the ClusterIP-only Internal Gateway.
 - `prometheus-budget` controls dispatch based on available inference capacity.
 - `workerPools` limits async processor concurrency.
@@ -1349,7 +1322,7 @@ done
 | `redhat-ods-operator` | RHAI operator — installed by RHAII |
 | `cert-manager` | cert-manager — installed by RHAII |
 | `kuadrant-system` | Kuadrant operator, Authorino, Limitador |
-| `batch-api` | batch-gateway (apiserver + processor + gc), Redis, PostgreSQL |
+| `batch-api` | batch-gateway (apiserver + processor + async-processor + gc), PostgreSQL |
 
 ## 6. Platform-Specific Considerations
 
