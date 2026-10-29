@@ -62,7 +62,7 @@ The `Authorization` header is included in `passThroughHeaders` by default. Witho
 
 ### 1.6 Flow Control
 
-Flow control ensures interactive inference requests are always served before batch requests. The EPP (Endpoint Picker Plugin) uses GIE's flow control feature to assign requests to priority bands based on the `x-gateway-inference-objective` header:
+Flow control ensures interactive inference requests are always served before batch requests. The EPP (Endpoint Picker Plugin) uses GIE's flow control feature to assign requests to priority bands based on the `x-llm-d-inference-objective` header (`x-gateway-inference-objective` is a deprecated alias):
 
 | Priority Band | Priority | Workload | Behavior Under Saturation |
 |---------------|----------|----------|---------------------------|
@@ -75,7 +75,7 @@ When the backend is not saturated, both interactive and batch requests are dispa
 This is configured through three components:
 
 1. **EndpointPickerConfig** in the LLMInferenceService CR (`spec.router.scheduler.config.inline`) enables the `flowControl` feature gate and defines priority bands, fairness policies, and saturation detection thresholds.
-2. **InferenceObjective CRDs** map objective names to priority levels. The batch processor sends the `x-gateway-inference-objective: batch-sheddable` header, which EPP resolves to priority -1.
+2. **InferenceObjective CRDs** map objective names to priority levels. The batch processor sends the `x-llm-d-inference-objective: batch-sheddable` header, which EPP resolves to priority -1. Create them in the `llm-d.ai` group (see [3.7](#37-create-inferenceobjective-crds)).
 3. **Batch processor `inferenceObjective` config** sets which `InferenceObjective` name is sent in the header on each inference request.
 
 For full details on flow control configuration, see the [Flow Control Setup Guide](flow-control-setup.md).
