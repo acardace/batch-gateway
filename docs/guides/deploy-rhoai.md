@@ -1138,10 +1138,10 @@ spec:
   dbBackend: postgresql
   fileStorage:
     s3:
+      bucket: ${MINIO_BUCKET}
       region: us-east-1
       endpoint: http://minio.${BATCH_NS}.svc.cluster.local:9000
       accessKeyId: ${MINIO_USER}
-      prefix: ${MINIO_BUCKET}
       usePathStyle: true
       autoCreateBucket: true
   apiServer:
