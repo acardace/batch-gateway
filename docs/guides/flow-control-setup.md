@@ -255,7 +255,7 @@ max_backoff: "30s"             # Max retry backoff
 
 #### InferenceObjective Configuration
 
-The `inference_objective` setting controls which `InferenceObjective` CRD name is sent in the `x-gateway-inference-objective` header. Set it directly on each gateway entry — `global_inference_gateway.inference_objective` or `model_gateways.<model>.inference_objective`. When empty, the header is not sent.
+The `inference_objective` setting controls which `InferenceObjective` CRD name is sent in the `x-gateway-inference-objective` header by the processor's sync dispatcher (llm-d-async sends the same objective as `x-llm-d-inference-objective`, and the router accepts both). Set it directly on each gateway entry — `global_inference_gateway.inference_objective` or `model_gateways.<model>.inference_objective`. When empty, the header is not sent.
 
 **Single-pool example** (all models share one InferencePool):
 
@@ -372,6 +372,9 @@ processor:
 
 The matching transport block (`asyncDispatch.sql` with `maxConnections`, or `asyncDispatch.redis`)
 and the queue names also have to be set; see the deployment guides for the full async configuration.
+`asyncDispatch.transport` and the SQL transport need a batch-gateway release that includes them
+([llm-d-batch-gateway#754](https://github.com/llm-d/llm-d-batch-gateway/pull/754)) — chart versions
+without it always use `redis-sortedset` and ignore the field.
 
 Only `inferencePoolName`, `inferenceObjective`, `requestQueueName` and `resultQueueName` are used per
 model in async mode; `request_timeout`, `max_retries` and the backoff settings are ignored. Shed
@@ -383,8 +386,10 @@ and falls back to a configured value when they are unavailable. Redis-specific g
 of `redis-quota` with the SQL transport.
 
 On ODH, these settings come from the `LLMBatchGateway` CR rather than Helm values:
-`spec.processor.dispatchMode`, `spec.processor.modelGateways.<model>.inferenceObjective` and
-`spec.processor.asyncConfig`. Do not edit the batch-gateway Deployments or ConfigMaps directly.
+`spec.processor.modelGateways.<model>.inferenceObjective` and `spec.processor.asyncConfig`. The
+operator dispatches asynchronously only and `spec.processor.asyncConfig` is required, so the
+synchronous `globalInferenceGateway`/`modelGateways.<model>.url` settings shown above are chart-only.
+Do not edit the batch-gateway Deployments or ConfigMaps directly.
 
 Returned headers from the router (`x-llm-d-request-dropped-reason`) are preserved through the queue,
 so shed causes stay distinguishable downstream: `rejected-saturated`, `rejected-ttl-expired`,
@@ -479,7 +484,7 @@ Key metrics to watch when running batch and interactive workloads together:
 The combination of llm-d Router flow control and Batch Gateway provides automatic, infrastructure-level workload balancing:
 
 - **llm-d Router flow control** handles admission, queuing, and dispatch ordering based on priority and SLO deadlines.
-- **Batch Gateway** communicates priority via `x-gateway-inference-objective`, urgency via `x-slo-ttft-ms`, and handles backpressure via retries.
+- **Batch Gateway** communicates priority via the inference-objective header (`x-llm-d-inference-objective`; `x-gateway-inference-objective` is accepted as a deprecated alias), urgency via `x-slo-ttft-ms`, and handles backpressure via retries.
 - **Priority bands** ensure interactive traffic always takes precedence.
 - **SLO-deadline ordering**, when configured on the batch band, serves the most urgent batch requests first.
 - **Saturation detection** automatically throttles all dispatch when the backend is overloaded.

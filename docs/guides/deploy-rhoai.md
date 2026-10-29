@@ -1049,7 +1049,7 @@ oc wait llmbatchgateway/batch-gateway -n ${BATCH_NS} \
 ```
 
 > - **`modelGateways.<model>.url`**: Points to the Internal Gateway's model endpoint. The Internal Gateway enforces AuthPolicy (model access check) but not TokenRateLimitPolicy.
-> - **`modelGateways.<model>.inferenceObjective`**: The `InferenceObjective` CRD name sent as the `x-llm-d-inference-objective` header (deprecated alias: `x-gateway-inference-objective`). EPP uses this to assign the request to the batch priority band (priority -1, sheddable). It must reference an `InferenceObjective` in the `llm-d.ai` group; see [3.7](#37-create-inferenceobjective-crds).
+> - **`modelGateways.<model>.inferenceObjective`**: The `InferenceObjective` CRD name sent as the `x-gateway-inference-objective` header. EPP uses this to assign the request to the batch priority band (priority -1, sheddable).
 > - **`tls.certManager`**: Enables TLS for the batch API server using cert-manager. In this demo the DestinationRule (see [3.11](#311-configure-httproute-and-policies-for-batch-gateway)) uses `insecureSkipVerify: true` because we use a self-signed certificate; in production, configure a trusted CA.
 > - **Images**: The operator pins component images (apiserver, processor, gc) from its deployment configuration. You do not set image references in the CR.
 > - **File storage**: This example uses S3-compatible storage (MinIO). To use a PVC instead, replace `fileStorage.s3` with:
