@@ -358,21 +358,24 @@ on the model entry:
 processor:
   config:
     dispatchMode: async
-    modelGateways:
-      "model-a":
-        inferencePoolName: "pool-a"
-        inferenceObjective: "batch-sheddable-a"
     asyncDispatch:
       transport: sql        # or redis-sortedset
+      maxConnections: 8     # SQL transport only: PostgreSQL connections per processor replica
       models:
         "model-a":
           inferencePoolName: "pool-a"
           inferenceObjective: "batch-sheddable-a"
+          requestQueueName: "llm-d-async:requests:pool-a"
+          resultQueueName: "llm-d-async:results:pool-a"
 ```
 
-The matching transport block (`asyncDispatch.sql` with `maxConnections`, or `asyncDispatch.redis`)
-and the queue names also have to be set; see the deployment guides for the full async configuration.
-`asyncDispatch.transport` and the SQL transport need a batch-gateway release that includes them
+The transport is a flat `asyncDispatch` field: `transport` selects SQL or `redis-sortedset`, and
+`maxConnections` (SQL only) budgets the PostgreSQL connections per processor replica against the
+database's `max_connections` — there are no `asyncDispatch.sql`/`asyncDispatch.redis` sub-blocks in
+the chart. Queue names default to the `llm-d-async:requests:<pool>` / `llm-d-async:results:<pool>`
+derivation from `inferencePoolName` (deprecated — set explicit names for new deployments); see the
+deployment guides for the full async configuration. `asyncDispatch.transport` and the SQL transport
+need a batch-gateway release that includes them
 ([llm-d-batch-gateway#754](https://github.com/llm-d/llm-d-batch-gateway/pull/754)) — chart versions
 without it always use `redis-sortedset` and ignore the field.
 
@@ -387,13 +390,21 @@ of `redis-quota` with the SQL transport.
 
 On ODH, these settings come from the `LLMBatchGateway` CR rather than Helm values:
 `spec.processor.modelGateways.<model>.inferenceObjective` and `spec.processor.asyncConfig`. The
-operator dispatches asynchronously only and `spec.processor.asyncConfig` is required, so the
-synchronous `globalInferenceGateway`/`modelGateways.<model>.url` settings shown above are chart-only.
-Do not edit the batch-gateway Deployments or ConfigMaps directly.
+backend-specific settings live on the CR at `spec.processor.asyncConfig.sql` (SQL queue settings
+such as `maxConnections` and `queuesConfig`) or `spec.processor.asyncConfig.redis` (Redis queue
+settings such as `queuesConfig`); the two are mutually exclusive and one is required. The operator
+dispatches asynchronously only, so the synchronous `globalInferenceGateway`/
+`modelGateways.<model>.url` settings shown above are chart-only. Do not edit the batch-gateway
+Deployments or ConfigMaps directly.
 
-Returned headers from the router (`x-llm-d-request-dropped-reason`) are preserved through the queue,
-so shed causes stay distinguishable downstream: `rejected-saturated`, `rejected-ttl-expired`,
-`rejected-no-endpoints`, or `evicted`.
+> **Shed causes are not distinguishable from the async result.** The async result contract carries
+> the status code, payload and error, but not the router's response headers — `NewHTTPResult`
+> records only the status and body — so `x-llm-d-request-dropped-reason` does not reach downstream
+> consumers, and a 429 cannot be attributed to `rejected-ttl-expired` vs. `rejected-no-endpoints`
+> (or an in-flight `evicted`) from result metadata alone. llm-d-async retries 429/5xx with backoff
+> regardless of cause; to distinguish shed causes, use the router's
+> `llm_d_epp_flow_control_requests_total` `outcome` label (see [Monitoring](#monitoring)) rather
+> than the returned result.
 
 #### Retry and timeout behavior in async mode
 
@@ -466,15 +477,17 @@ Key metrics to watch when running batch and interactive workloads together:
 | Request evictions (TTL) | llm-d Router flow control | Batch evictions = SLO deadlines being missed |
 | 429/503 response rate | Batch Gateway metrics | 429 (queue TTL or band capacity exceeded) = flow control is shedding batch under saturation; 503 = the pool has no endpoints |
 | Batch job completion rate | Batch Gateway metrics | Should meet SLO deadlines under normal load |
-| `llm_d_epp_flow_control_requests_total` | llm-d Router | Labels `priority` and `outcome` (`Dispatched`, `Rejected`, `Evicted`, …). `{priority="-1"}` confirms batch traffic is landing in the sheddable band |
+| `llm_d_epp_flow_control_requests_total` | llm-d Router | Counter with labels `outcome`, `priority`, `inference_pool`. Outcome values are `Dispatched`, `RejectedCapacity`, `RejectedNoEndpoints`, `RejectedOther`, `EvictedTTL`, `EvictedNoEndpoints`, `EvictedContextCancelled`, `EvictedOther`. `{priority="-1"}` confirms batch traffic is landing in the sheddable band |
 
 > **Metric naming:** Router v0.8.0 and earlier used the legacy
 > `inference_extension_*` names. Router v0.9.0-v0.10.x also emits the current signals under
 > `llm_d_epp_flow_control_pool_saturation`,
 > `llm_d_epp_flow_control_queue_size`, and
 > `llm_d_epp_flow_control_request_queue_duration_seconds`. Router v0.11.0+
-> emits only the `llm_d_epp_*` names. Flow-control metrics are labelled by `priority`
-> (`pool_saturation` by `stage`: `decode`, `prefill`, `effective`).
+> emits only the `llm_d_epp_*` names. Label sets differ per metric: `requests_total`, `queue_size`,
+> `queue_duration` and the capacity-utilization gauges carry a `priority` label (so
+> `{priority="-1"}` filters to the batch band on those only), while `pool_saturation` is labeled by
+> `inference_pool` and `stage` (`decode`, `prefill`, `effective`) and has no `priority` label.
 >
 > On ODH the EPP metrics endpoint requires ServiceAccount token authentication
 > (`authorization.credentials_file` in the Prometheus scrape config).
