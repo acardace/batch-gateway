@@ -182,7 +182,7 @@ $ helm install postgresql bitnami/postgresql -n batch-api \
     --wait --timeout 120s
 ```
 
-> **Note — Redis transport**: `asyncConfig.redis` (Redis/Valkey sorted sets, the chart default) is still supported. Only then is a Redis instance required and `redis-url` must be added to the credentials Secret.
+> **Note — Redis transport**: `asyncConfig.redis` (Redis/Valkey sorted sets) is still supported and selects the `redis-sortedset` transport. Only then is a Redis instance required and `redis-url` must be added to the credentials Secret.
 
 ### 4.2 Create Secret and PVC
 
@@ -193,7 +193,7 @@ The credentials Secret is referenced by `spec.secretRef`. Required keys:
 
 `redis-url` is only required when using the `redis-sortedset` transport; it is omitted here.
 
-The async-processor calls models through the MaaS gateway over HTTPS. The gateway's listener certificate is signed by the cluster's internal ingress CA, so the async-processor needs that CA to verify it (the LLMBatchGateway API forbids `insecureSkipVerify`). Extract the CA from the certificate chain referenced by the Gateway:
+The async-processor calls models through the MaaS gateway over HTTPS. The gateway's listener certificate is signed by the cluster's internal ingress CA, so the async-processor needs that CA to verify it — this guide mounts the CA and verifies the chain rather than setting `asyncConfig.tls.insecureSkipVerify`, which the API accepts but marks as not recommended for production. Extract the CA from the certificate chain referenced by the Gateway:
 
 ```bash
 # Certificate secret used by the MaaS gateway listener
@@ -247,7 +247,7 @@ The CR replaces the Helm install. Everything the Helm flags used to configure is
 | `apiserver.tls.certManager.*` | `spec.tls.certManager.*` |
 | (manual HTTPRoute, see 4.5) | `spec.httpRoute.*` |
 
-Container images are **not** set in the CR — the platform controls them through the operator deployment (see the operator's [ODH installation guide](https://github.com/opendatahub-io/llm-d-batch-gateway-operator/blob/main/docs/odh-installation.md)).
+Container images are **not** set in the CR — the platform controls them through the operator deployment (see the operator's [ODH installation guide](https://github.com/opendatahub-io/llm-d-batch-gateway-operator/blob/main/docs/odh-installation.md)). `spec.processor.asyncConfig` is **required**: the operator always dispatches asynchronously through the async-processor and has no synchronous path, so there is no dispatch-mode switch to set.
 
 `passThroughHeaders={Authorization,X-MaaS-Subscription}` ensures the API key and subscription header are stored with each batch job and forwarded to the model for authentication and rate limiting. The async-processor reaches the MaaS gateway via its **external hostname** (`https://maas.<cluster-domain>`) so that the certificate's SAN matches the hostname — the internal service DNS name does not match the certificate SAN. `asyncConfig.tls` points the async-processor at the `maas-gateway-ca` key of the credentials Secret for certificate verification.
 
@@ -278,7 +278,6 @@ spec:
         - Authorization
         - X-MaaS-Subscription
   processor:
-    dispatchMode: async
     modelGateways:
       facebook/opt-125m:
         inferencePoolName: ${POOL_NAME}
