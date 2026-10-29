@@ -965,13 +965,26 @@ oc create secret generic batch-gateway-secrets \
 
 The batch-gateway is deployed via the `LLMBatchGateway` CR, which is managed by the batch-gateway-operator (deployed automatically when `aigateway.batchGateway.managementState: Managed` is set in the DataScienceCluster).
 
-batch-gateway has a single dispatch path: the processor writes each inference request to an async dispatch queue, and the async-processor sends it to the model server through the Internal Gateway. Synchronous dispatch is no longer supported by the operator, so `spec.processor.asyncConfig` is required in every CR. This guide uses the PostgreSQL (`sql`) queue transport, which reuses the Secret's `postgresql-url` — PostgreSQL is the only stateful dependency.
+batch-gateway dispatches every batch inference request asynchronously: the processor writes each request to an async dispatch queue, and the async-processor sends it to the model server through the Internal Gateway. The CR below omits `dispatchMode` on purpose — releases that still accept the field default it to `async`, and releases after [llm-d-batch-gateway-operator#125](https://github.com/opendatahub-io/llm-d-batch-gateway-operator/pull/125) deprecate it and always dispatch asynchronously, with `spec.processor.asyncConfig` required. This guide uses the PostgreSQL (`sql`) queue transport, which reuses the Secret's `postgresql-url` — PostgreSQL is the only stateful dependency.
+
+> **Check the installed CRD first**: the SQL transport needs an operator build whose CRD includes it. Verify before you deploy, and on the RHOAI path confirm the promoted `aigateway` bundle carries it:
+>
+> ```bash
+> $ kubectl explain llmbatchgateway.spec.processor.asyncConfig.sql
+> GROUP:      batch.llm-d.ai
+> KIND:       LLMBatchGateway
+> VERSION:    v1alpha1
+>
+> FIELD: sql <Object>
+> ```
+>
+> `Error from server (NotFound)` means the installed operator predates SQL support: upgrade the operator, or follow the Redis/Valkey transport alternative at the end of this section — it works on every release.
 
 Dispatching is driven by [llm-d-async](https://github.com/llm-d/llm-d-async): the async-processor uses a dispatch gate to control when requests are sent to the model server. This example uses the `prometheus-budget` gate, which requires Prometheus scraping EPP and vLLM metrics (deployed below). See [llm-d-async dispatch gates](https://github.com/llm-d/llm-d-async#per-queue-dispatch-gates) for other gate types.
 
 > - **`modelGateways.<model>.inferencePoolName`**: The InferencePool whose queue feeds this model. The processor requires one consumer per pool, so each model gateway entry needs its own pool.
 > - **`modelGateways.<model>.inferenceObjective`**: The `InferenceObjective` CRD name sent as the `x-llm-d-inference-objective` header (deprecated alias: `x-gateway-inference-objective`). EPP uses this to assign the request to the batch priority band (priority -1, sheddable). It must reference an `InferenceObjective` in the `llm-d.ai` group; see [3.7](#37-create-inferenceobjective-crds).
-> - **`asyncConfig`**: Required. The operator always deploys an async-processor component and configures the queues, worker pools, Prometheus URL, and dispatch gates from this block. `asyncConfig.sql` selects the PostgreSQL transport; `asyncConfig.redis` (Redis/Valkey sorted sets) is the alternative.
+> - **`asyncConfig`**: Required for async dispatch (CRD-required after operator #125). The operator always deploys an async-processor component and configures the queues, worker pools, Prometheus URL, and dispatch gates from this block. `asyncConfig.sql` selects the PostgreSQL transport; `asyncConfig.redis` (Redis/Valkey sorted sets) is the alternative.
 > - **`igwBaseURL`**: The async-processor sends inference requests through the Internal Gateway. Pass-through headers (including Authorization) are forwarded, so AuthPolicy works.
 > - **`gate_type: prometheus-budget`**: Computes a dispatch budget from EPP flow control metrics (primary) with vLLM metrics fallback. Requires `prometheusURL` and `gate_params.pool`.
 > - **`tls.certManager`**: Enables TLS for the batch API server using cert-manager. In this demo the DestinationRule (see [3.11](#311-configure-httproute-and-policies-for-batch-gateway)) uses `insecureSkipVerify: true` because we use a self-signed certificate; in production, configure a trusted CA.
