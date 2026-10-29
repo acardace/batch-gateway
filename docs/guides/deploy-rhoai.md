@@ -31,7 +31,7 @@ This guide demonstrates how to deploy batch-gateway on OpenShift with RHOAI (Red
     - **AuthPolicy** on the batch-route performs authentication only (kubernetesTokenReview, no authorization check) — unauthenticated requests are rejected with 401
     - **RateLimitPolicy** on the batch-route enforces per-user request rate limiting (e.g. 20 req/min), keyed by Kubernetes username (user or ServiceAccount) from TokenReview — excess requests are rejected with 429
     - Authenticated request is forwarded to **batch-gateway apiserver**, which stores the batch job
-3. **Processor** dequeues the batch job and sends inference requests through a separate **Internal Gateway** (`batch-internal-gateway`) — a ClusterIP-only Gateway that is not externally accessible — with the user's original token
+3. **Processor** dequeues the batch job and enqueues each inference request on the async dispatch queue (PostgreSQL); the **async-processor** sends them through a separate **Internal Gateway** (`batch-internal-gateway`) — a ClusterIP-only Gateway that is not externally accessible — with the user's original token
 4. The Internal Gateway matches `/{ns}/{isvc}/v1/*` → **batch-llm-route** (HTTPRoute)
     - **AuthPolicy** on the batch-llm-route performs authentication and authorization (SubjectAccessReview — checks if the original user can `get llminferenceservices/<name>`) — if the user lacks permission, the request is rejected with 403
     - **No TokenRateLimitPolicy** — batch inference requests are exempt from per-user token rate limits
@@ -49,14 +49,14 @@ Both the LLM route and the batch route use **kubernetesTokenReview** for authent
 Model access is controlled through Kubernetes RBAC. Users need `get` permission on the specific `LLMInferenceService` resource to access a model. This is granted by creating a Role and RoleBinding in the model's namespace (see [Enabling authentication and authorization for LLM inference service](https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.5/html/deploy_models_using_distributed_inference_with_llm-d/enabling-authentication-and-authorization-for-llm-inference-service_distributed-inference) for details).
 
 - **LLM route**: SubjectAccessReview checks if user can `get llminferenceservices/<name>` — unauthorized requests are rejected with **403**
-- **Batch route**: No authorization check — authorization is enforced by the batch-llm-route on the Internal Gateway when the processor forwards inference requests with the user's original token
+- **Batch route**: No authorization check — authorization is enforced by the batch-llm-route on the Internal Gateway when the async-processor forwards inference requests with the user's original token
 
 ### 1.5 Security boundary: batch-route vs batch-llm-route
 
 For security and operations readers: **admission on the batch API is not the same as authorization for inference.**
 
 - **batch-route** proves the caller has a valid Kubernetes token and applies batch-side **RateLimitPolicy**. Invalid or missing credentials are rejected with **401**; excess batch API traffic is rejected with **429**. It does **not** evaluate whether the caller may use a specific `LLMInferenceService`.
-- **batch-llm-route** (on the Internal Gateway) runs **authentication and authorization** (SubjectAccessReview on `llminferenceservices` as above) on each inference request the processor sends. The Internal Gateway is ClusterIP-only — it has no external Route or Ingress, ensuring batch inference traffic stays cluster-internal. **No TokenRateLimitPolicy** is applied, so batch requests are exempt from per-user token rate limits. A user can create a batch job and still see **per-request failures** (often surfaced as failed lines or job errors) when the batch-llm-route returns **403** — this is **by design**, not a bypass of model access control.
+- **batch-llm-route** (on the Internal Gateway) runs **authentication and authorization** (SubjectAccessReview on `llminferenceservices` as above) on each inference request the async-processor sends. The Internal Gateway is ClusterIP-only — it has no external Route or Ingress, ensuring batch inference traffic stays cluster-internal. **No TokenRateLimitPolicy** is applied, so batch requests are exempt from per-user token rate limits. A user can create a batch job and still see **per-request failures** (often surfaced as failed lines or job errors) when the batch-llm-route returns **403** — this is **by design**, not a bypass of model access control.
 
 The `Authorization` header is included in `passThroughHeaders` by default. Without it, the Internal Gateway cannot attribute inference traffic to the original caller and model-level checks cannot run as intended.
 
@@ -706,7 +706,7 @@ oc wait tokenratelimitpolicy/inference-token-limit \
 
 ### 3.9 Batch Gateway Dependencies
 
-The batch processor routes inference requests through a separate, ClusterIP-only Internal Gateway to bypass the TokenRateLimitPolicy on the external Gateway while still enforcing model-level authorization (AuthPolicy).
+The async-processor routes inference requests through a separate, ClusterIP-only Internal Gateway to bypass the TokenRateLimitPolicy on the external Gateway while still enforcing model-level authorization (AuthPolicy).
 
 Set the variables used throughout this section (re-set them if starting a new shell):
 ```bash
@@ -809,7 +809,7 @@ spec:
 EOF
 ```
 
-> **Same path pattern**: The batch-llm-route uses the same `/{namespace}/{isvc-name}/v1/*` path pattern as the auto-generated LLM route on the external Gateway. This allows the processor to use the same URL format.
+> **Same path pattern**: The batch-llm-route uses the same `/{namespace}/{isvc-name}/v1/*` path pattern as the auto-generated LLM route on the external Gateway. This allows the async-processor to use the same URL format.
 
 > **URL rewrite**: Each rule strips the `/{namespace}/{isvc-name}` prefix before forwarding to the InferencePool, matching the rewrite behavior of the auto-generated LLM route.
 
@@ -957,7 +957,7 @@ oc create secret generic batch-gateway-secrets \
     --dry-run=client -o yaml | oc apply -f -
 ```
 
-> **Note**: `redis-url` is only required by the `redis-sortedset` async transport (see [3.10.2](#3102-option-2-async-dispatch)); the SQL transport used there reuses `postgresql-url`, so this guide needs no Redis instance.
+> **Note**: `redis-url` is only required by the `redis-sortedset` async transport (see [3.10](#310-install-batch-gateway)); the SQL transport used there reuses `postgresql-url`, so this guide needs no Redis instance.
 
 </details>
 
@@ -965,74 +965,17 @@ oc create secret generic batch-gateway-secrets \
 
 The batch-gateway is deployed via the `LLMBatchGateway` CR, which is managed by the batch-gateway-operator (deployed automatically when `aigateway.batchGateway.managementState: Managed` is set in the DataScienceCluster).
 
-Choose **one** of the two dispatch modes below (sync or async).
+batch-gateway has a single dispatch path: the processor writes each inference request to an async dispatch queue, and the async-processor sends it to the model server through the Internal Gateway. Synchronous dispatch is no longer supported by the operator, so `spec.processor.asyncConfig` is required in every CR. This guide uses the PostgreSQL (`sql`) queue transport, which reuses the Secret's `postgresql-url` — PostgreSQL is the only stateful dependency.
 
-#### 3.10.1 Option 1: Sync dispatch (default)
+Dispatching is driven by [llm-d-async](https://github.com/llm-d/llm-d-async): the async-processor uses a dispatch gate to control when requests are sent to the model server. This example uses the `prometheus-budget` gate, which requires Prometheus scraping EPP and vLLM metrics (deployed below). See [llm-d-async dispatch gates](https://github.com/llm-d/llm-d-async#per-queue-dispatch-gates) for other gate types.
 
-<details>
-<summary>Create LLMBatchGateway CR (sync)</summary>
-
-The processor sends inference requests directly to the Internal Gateway via HTTP.
-
-```bash
-# Get model URL from the Internal Gateway service
-INTERNAL_GW_SVC=$(oc get svc -n openshift-ingress \
-    -l "gateway.networking.k8s.io/gateway-name=batch-internal-gateway" \
-    -o jsonpath='{.items[0].metadata.name}')
-MODEL_URL="http://${INTERNAL_GW_SVC}.openshift-ingress.svc.cluster.local/${LLM_NS}/${ISVC_NAME}"
-
-oc apply -f - <<EOF
-apiVersion: batch.llm-d.ai/v1alpha1
-kind: LLMBatchGateway
-metadata:
-  name: batch-gateway
-  namespace: ${BATCH_NS}
-spec:
-  secretRef:
-    name: batch-gateway-secrets
-  dbBackend: postgresql
-  fileStorage:
-    s3:
-      region: us-east-1
-      endpoint: http://minio.${BATCH_NS}.svc.cluster.local:9000
-      accessKeyId: ${MINIO_USER}
-      prefix: ${MINIO_BUCKET}
-      usePathStyle: true
-      autoCreateBucket: true
-  apiServer:
-    replicas: 1
-  processor:
-    replicas: 1
-    modelGateways:
-      ${MODEL_NAME}:
-        url: ${MODEL_URL}
-        requestTimeout: 5m
-        maxRetries: 3
-        initialBackoff: 1s
-        maxBackoff: 60s
-        inferenceObjective: batch-sheddable
-  gc:
-    interval: 30m
-  tls:
-    enabled: true
-    certManager:
-      issuerName: selfsigned-issuer
-      issuerKind: ClusterIssuer
-      dnsNames:
-      - batch-gateway-apiserver
-      - batch-gateway-apiserver.${BATCH_NS}.svc.cluster.local
-      - localhost
-EOF
-
-# Wait for the batch gateway to be ready
-oc wait llmbatchgateway/batch-gateway -n ${BATCH_NS} \
-    --for=condition=Ready --timeout=300s
-```
-
-> - **`modelGateways.<model>.url`**: Points to the Internal Gateway's model endpoint. The Internal Gateway enforces AuthPolicy (model access check) but not TokenRateLimitPolicy.
+> - **`modelGateways.<model>.inferencePoolName`**: The InferencePool whose queue feeds this model. The processor requires one consumer per pool, so each model gateway entry needs its own pool.
 > - **`modelGateways.<model>.inferenceObjective`**: The `InferenceObjective` CRD name sent as the `x-gateway-inference-objective` header. EPP uses this to assign the request to the batch priority band (priority -1, sheddable).
+> - **`asyncConfig`**: Required. The operator always deploys an async-processor component and configures the queues, worker pools, Prometheus URL, and dispatch gates from this block. `asyncConfig.sql` selects the PostgreSQL transport; `asyncConfig.redis` (Redis/Valkey sorted sets) is the alternative.
+> - **`igwBaseURL`**: The async-processor sends inference requests through the Internal Gateway. Pass-through headers (including Authorization) are forwarded, so AuthPolicy works.
+> - **`gate_type: prometheus-budget`**: Computes a dispatch budget from EPP flow control metrics (primary) with vLLM metrics fallback. Requires `prometheusURL` and `gate_params.pool`.
 > - **`tls.certManager`**: Enables TLS for the batch API server using cert-manager. In this demo the DestinationRule (see [3.11](#311-configure-httproute-and-policies-for-batch-gateway)) uses `insecureSkipVerify: true` because we use a self-signed certificate; in production, configure a trusted CA.
-> - **Images**: The operator pins component images (apiserver, processor, gc) from its deployment configuration. You do not set image references in the CR.
+> - **Images**: The operator pins component images (apiserver, processor, async-processor, gc) from its deployment configuration. You do not set image references in the CR.
 > - **File storage**: This example uses S3-compatible storage (MinIO). To use a PVC instead, replace `fileStorage.s3` with:
 >   ```yaml
 >   fileStorage:
@@ -1041,17 +984,6 @@ oc wait llmbatchgateway/batch-gateway -n ${BATCH_NS} \
 >       claimName: <your-pvc-name>
 >   ```
 >   The PVC must have `ReadWriteMany` access mode (requires NFS, CephFS, or similar).
-
-</details>
-
-#### 3.10.2 Option 2: Async dispatch
-
-Uses [llm-d-async](https://github.com/llm-d/llm-d-async). The async-processor uses a dispatch gate to control when requests are sent to the model server. This example uses the `prometheus-budget` gate, which requires Prometheus scraping EPP and vLLM metrics. See [llm-d-async dispatch gates](https://github.com/llm-d/llm-d-async#per-queue-dispatch-gates) for other gate types.
-
-> - **`dispatchMode: async`** + **`inferencePoolName`**: The processor sends requests to the async dispatch queues instead of making direct HTTP calls. This replaces `modelGateways.<model>.url`/`requestTimeout`/`maxRetries`/etc.
-> - **`asyncConfig`**: The operator deploys an async-processor component automatically. The `asyncConfig` block selects the queue transport (`sql` below, or `redis`), and configures the queues, worker pools, Prometheus URL, and dispatch gates. The SQL transport reuses the Secret's `postgresql-url`, so no extra dependency is needed.
-> - **`igwBaseURL`**: The async-processor sends inference requests through the Internal Gateway (same path as sync). Pass-through headers (including Authorization) are forwarded, so AuthPolicy works.
-> - **`gate_type: prometheus-budget`**: Computes a dispatch budget from EPP flow control metrics (primary) with vLLM metrics fallback. Requires `prometheusURL` and `gate_params.pool`.
 
 <details>
 <summary>Deploy Prometheus (required for prometheus-budget gate)</summary>
@@ -1181,7 +1113,7 @@ oc rollout status deployment/prometheus -n ${LLM_NS} --timeout=120s
 </details>
 
 <details>
-<summary>Create LLMBatchGateway CR (async)</summary>
+<summary>Create LLMBatchGateway CR</summary>
 
 ```bash
 INTERNAL_GW_SVC=$(oc get svc -n openshift-ingress \
@@ -1216,7 +1148,6 @@ spec:
     replicas: 1
   processor:
     replicas: 1
-    dispatchMode: async
     modelGateways:
       ${MODEL_NAME}:
         inferencePoolName: ${POOL_NAME}
@@ -1270,7 +1201,70 @@ oc wait llmbatchgateway/batch-gateway -n ${BATCH_NS} \
 > - The `asyncConfig` block is operator-managed: the operator deploys an `async-processor` Deployment automatically based on this configuration. You do not deploy the async-processor separately (unlike the Helm-based K8s path).
 > - **`modelGateways` keys**: A key must exactly match the `model` field in batch request bodies — the processor rejects requests for unregistered models at ingestion. It must also be a name the model server accepts: the simulated model used above takes any name, but a real vLLM deployment requires the served model ID (for example `meta-llama/Llama-3.1-8B-Instruct`), which can differ from the `LLMInferenceService` name used in gateway URL paths. Requests naming anything else pass routing but fail with a 404 from the model server.
 > - **`workerPools`**: Each worker pool has its own gate. The `local-max-concurrency` gate on `default-workers` limits concurrent in-flight requests per worker, while the `prometheus-budget` gate on the queue controls overall dispatch rate based on cluster capacity.
-> - **`asyncConfig.sql`**: The PostgreSQL dispatch transport. The processor and the async-processor both use the Secret's `postgresql-url`. `maxConnections` caps the processor's SQL pool per replica (default 8) — budget `processor replicas × maxConnections` plus the async-processor's own pool against PostgreSQL `max_connections`. With SQL, each model gateway entry must resolve to its own result queue (default `llm-d-async:results:<inferencePoolName>`) and use a distinct `inferencePoolName`, because results are read destructively per model. For a cluster that already runs Redis or Valkey, replace this block with `asyncConfig.redis` (`requestPathURL`, `pollIntervalMs`, `batchSize`, `queuesConfig`) and add `redis-url` to the Secret.
+> - **`asyncConfig.sql`**: The PostgreSQL dispatch transport. The processor and the async-processor both use the Secret's `postgresql-url`. `maxConnections` caps the processor's SQL pool per replica (default 8) — budget `processor replicas × maxConnections` plus the async-processor's own pool against PostgreSQL `max_connections`. With SQL, each model gateway entry must resolve to its own result queue (default `llm-d-async:results:<inferencePoolName>`) and use a distinct `inferencePoolName`, because results are read destructively per model. To keep the queues in Redis/Valkey instead of PostgreSQL, see the alternative at the end of this section.
+
+</details>
+
+<details>
+<summary>Alternative: Redis/Valkey queue transport</summary>
+
+Instead of PostgreSQL, the queues can live in Redis — selected with `asyncConfig.redis` (`redis-sortedset` transport). Everything above still applies: the same queues, worker pools, gates and Internal Gateway URL, and PostgreSQL is still required for batch job state. The differences are one extra workload and a `redis-url` key in the Secret.
+
+```bash
+# Install Redis (or Valkey — wire-protocol compatible)
+helm upgrade --install redis oci://registry-1.docker.io/bitnamicharts/redis \
+    --namespace ${BATCH_NS} --create-namespace \
+    --set architecture=standalone \
+    --set auth.enabled=false
+oc rollout status statefulset/redis-master -n ${BATCH_NS} --timeout=120s
+
+# Alternative: Valkey
+# helm upgrade --install redis oci://registry-1.docker.io/bitnamicharts/valkey \
+#     --namespace ${BATCH_NS} --create-namespace \
+#     --set architecture=standalone \
+#     --set auth.enabled=false
+# oc rollout status statefulset/redis-valkey-primary -n ${BATCH_NS} --timeout=120s
+# Note: when using Valkey, use redis://redis-valkey-primary.${BATCH_NS}.svc.cluster.local:6379/0 below
+
+# Add the queue URL to the existing application secret
+REDIS_URL="redis://redis-master.${BATCH_NS}.svc.cluster.local:6379/0"
+oc patch secret batch-gateway-secrets -n ${BATCH_NS} --type merge \
+    -p "{\"data\":{\"redis-url\":\"$(printf %s "${REDIS_URL}" | base64 -w0)\"}}"
+```
+
+> **Note**: Redis auth is disabled for demo purposes. For production, enable authentication and use a `rediss://` URL.
+
+Then replace the `sql:` block of the CR with the Redis one (`maxConnections` does not apply):
+
+```yaml
+      redis:
+        pollIntervalMs: 500
+        batchSize: 10
+        queuesConfig:
+        - name: "llm-d-async:requests:${POOL_NAME}"
+          requestPathURL: /v1/chat/completions
+          igwBaseURL: ${MODEL_URL}
+          gateType: prometheus-budget
+          gateParams:
+            pool: "${POOL_NAME}"
+            namespace: "${LLM_NS}"
+            max_concurrency: "100"
+            baseline: "0.05"
+            fallback: "1.0"
+          workerPoolID: default-workers
+```
+
+and re-apply the CR with `asyncConfig.redis` in place of `asyncConfig.sql`, keeping the same `modelGateways`, `workerPools`, `tls` and `gc` sections:
+
+```bash
+oc apply -f llmbatchgateway.yaml
+oc wait llmbatchgateway/batch-gateway -n ${BATCH_NS} \
+    --for=condition=Ready --timeout=300s
+```
+
+> - **Gates**: most gates are transport-independent, but `redis`, `redis-leased-rate` and `redis-quota` require this transport — on SQL, use `sql-quota` in place of `redis-quota`.
+> - **Result queues**: each model still needs its own `inferencePoolName`; the processor appends its replica identity to `llm-d-async:results:<inferencePoolName>`.
+> - **Switching transports on an existing deployment**: drain or cancel in-flight batches first — queued requests are not migrated between the two backends.
 
 </details>
 
@@ -1517,7 +1511,7 @@ curl -sk -o /dev/null -w "%{http_code}\n" \
 
 ```bash
 # Unauthorized user creates a batch — batch is accepted (batch route has no authz),
-# but the processor forwards requests to the batch-llm-route (Internal Gateway)
+# but the async-processor forwards requests to the batch-llm-route (Internal Gateway)
 # with the unauthorized token, and its AuthPolicy rejects with 403.
 
 # Create input file
