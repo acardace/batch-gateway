@@ -8,6 +8,7 @@ This guide focuses on the MaaS integration: exposing the batch API through the M
 
 [MaaS]: https://github.com/opendatahub-io/models-as-a-service
 [batch-gateway-operator]: https://github.com/opendatahub-io/llm-d-batch-gateway-operator
+[models-as-a-service]: https://github.com/opendatahub-io/models-as-a-service
 
 ## Prerequisites
 
@@ -41,13 +42,13 @@ All authentication uses **MaaS API keys** (`sk-oai-*`). Users create API keys vi
 
 ## 1. Install MaaS Platform and the Batch Gateway Operator
 
-Install MaaS following the [MaaS installation guide](https://opendatahub-io.github.io/models-as-a-service/install/maas-setup/): install the ODH/RHOAI operator, create the `maas-db-config` Secret, create the `maas-default-gateway` Gateway, then enable MaaS in your DataScienceCluster.
+Install MaaS following the [MaaS installation guide](https://github.com/opendatahub-io/models-as-a-service/blob/main/docs/content/install/maas-setup.md) (see also the repository's [quickstart](https://github.com/opendatahub-io/models-as-a-service/blob/main/docs/content/quickstart.md)): install the ODH/RHOAI operator, create the `maas-db-config` Secret, create the `maas-default-gateway` Gateway, then enable MaaS in your DataScienceCluster. The install path and the Gateway's route selector are release-specific — always follow the installation guide for your platform release. For the Gateway created by `scripts/setup-gateway.sh`, the namespaces allowed to attach HTTPRoutes are controlled by `NAMESPACE_SELECTOR_LABELS` (see [section 4.5](#45-httproute--created-by-the-operator)).
 
 The batch-gateway-operator is deployed by the same `aigateway` component, so enable both sub-components in one DataScienceCluster:
 
 ```bash
 $ kubectl apply -f - <<EOF
-apiVersion: datasciencecluster.opendatahub.io/v2
+apiVersion: datasciencecluster.opendatahub.io/v3
 kind: DataScienceCluster
 metadata:
   name: default-dsc
@@ -61,6 +62,13 @@ spec:
         managementState: Managed
 EOF
 ```
+
+> **Note — DSC API version**: this guide targets RHOAI 3.6 / the 3.6 batch-gateway-operator chart, which serves `datasciencecluster.opendatahub.io/v3`. Earlier ODH releases serve `v2`. Use the version served by the installed CRD as the source of truth:
+>
+> ```bash
+> $ kubectl api-versions | grep datasciencecluster.opendatahub.io
+> datasciencecluster.opendatahub.io/v3
+> ```
 
 Verify the operators and MaaS are running (on RHOAI the applications land in `redhat-ods-applications`; on ODH in `opendatahub`):
 
@@ -147,6 +155,12 @@ $ oc adm groups add-users tier-free-users testuser
 
 ## 3. Deploy a Sample Model
 
+Clone the [models-as-a-service] repository — the sample manifests and the `setup-gateway.sh` script used later in this guide come from it:
+
+```bash
+$ git clone https://github.com/opendatahub-io/models-as-a-service.git /tmp/maas
+```
+
 Deploy the simulator-based LLMInferenceService:
 
 ```bash
@@ -170,11 +184,15 @@ facebook-opt-125m-simulated-inference-pool   30s
 
 ### 4.1 Create Namespace and Databases
 
-The LLMBatchGateway CR does **not** provision databases: PostgreSQL is an external dependency, backing both batch job state and — with the SQL transport used in this guide — the async request/result queues. For production use a managed instance.
+**The LLMBatchGateway operator does not provision or manage PostgreSQL.** PostgreSQL is a customer-managed external dependency, backing both batch job state and — with the SQL transport used in this guide — the async request/result queues.
+
+- **Production**: bring your own PostgreSQL service (managed instance or in-cluster database you operate) with persistence, backups, credential protection, TLS, and HA managed outside this guide, and provide its connection URL through the `postgresql-url` key of the credentials Secret below. Never use the example credentials.
+- **Development only**: the Bitnami Helm install below is a disposable development convenience for trying this guide on a test cluster. It embeds the weak `postgres:postgres` credential and disables persistence — do **not** use it as the production path, and never commit real credentials to the manifests.
 
 ```bash
 $ kubectl create namespace batch-api
 
+# DEVELOPMENT ONLY — disposable, non-persistent, weak credentials
 $ helm repo add bitnami https://charts.bitnami.com/bitnami
 $ helm install postgresql bitnami/postgresql -n batch-api \
     --set auth.postgresPassword=postgres \
@@ -193,7 +211,7 @@ The credentials Secret is referenced by `spec.secretRef`. Required keys:
 
 `redis-url` is only required when using the `redis-sortedset` transport; it is omitted here.
 
-The async-processor calls models through the MaaS gateway over HTTPS. The gateway's listener certificate is signed by the cluster's internal ingress CA, so the async-processor needs that CA to verify it — this guide mounts the CA and verifies the chain rather than setting `asyncConfig.tls.insecureSkipVerify`, which the API accepts but marks as not recommended for production. Extract the CA from the certificate chain referenced by the Gateway:
+The async-processor calls models through the MaaS gateway over HTTPS. The gateway's listener certificate is signed by the cluster's internal ingress CA, so the async-processor needs that CA to verify it — this guide mounts the CA and verifies the chain, leaving `insecureSkipVerify` unset. The API accepts `asyncConfig.tls.insecureSkipVerify` (it is not rejected by CRD validation); production policy must prohibit disabling certificate verification. Extract the CA from the certificate chain referenced by the Gateway:
 
 ```bash
 # Certificate secret used by the MaaS gateway listener
@@ -209,10 +227,12 @@ $ openssl x509 -in "${MAAS_GW_CA}" -noout -subject
 subject=CN=ingress-operator@1777551671
 ```
 
-> **Note**: if the MaaS gateway uses a certificate signed by a public CA, skip the `maas-gateway-ca` key — the async-processor trusts system roots by default and `asyncConfig.tls` is not needed.
+> **Note**: if the MaaS gateway uses a certificate signed by a public CA, skip the `maas-gateway-ca` key **and remove the entire `asyncConfig.tls` block** from the CR in [section 4.3](#43-create-the-llmbatchgateway-cr) — the async-processor trusts system roots by default and `asyncConfig.tls` is not needed. Keeping the block without the referenced key in the Secret fails.
 
 ```bash
-# App secret with the database URL and the gateway CA
+# DEVELOPMENT example — uses the disposable Bitnami instance from 4.1.
+# In production, point postgresql-url at your customer-managed PostgreSQL
+# (with TLS and credential protection); do not reuse these credentials.
 $ kubectl create secret generic batch-gateway-secrets -n batch-api \
     --from-literal=postgresql-url=postgresql://postgres:postgres@postgresql.batch-api.svc.cluster.local:5432/postgres \
     --from-file=maas-gateway-ca="${MAAS_GW_CA}"
@@ -247,9 +267,22 @@ The CR replaces the Helm install. Everything the Helm flags used to configure is
 | `apiserver.tls.certManager.*` | `spec.tls.certManager.*` |
 | (manual HTTPRoute, see 4.5) | `spec.httpRoute.*` |
 
-Container images are **not** set in the CR — the platform controls them through the operator deployment (see the operator's [ODH installation guide](https://github.com/opendatahub-io/llm-d-batch-gateway-operator/blob/main/docs/odh-installation.md)). `spec.processor.asyncConfig` is **required**: the operator always dispatches asynchronously through the async-processor and has no synchronous path, so there is no dispatch-mode switch to set.
+Container images are **not** set in the CR — the platform controls them through the operator deployment (see the operator's [ODH installation guide](https://github.com/opendatahub-io/llm-d-batch-gateway-operator/blob/main/docs/odh-installation.md)). `spec.processor.asyncConfig` is **required**: the operator always dispatches asynchronously through the async-processor and has no synchronous path. (`processor.dispatchMode` is retained in the API for compatibility, but only `async` is allowed and the operator ignores it; new manifests should omit it.)
 
-`passThroughHeaders={Authorization,X-MaaS-Subscription}` ensures the API key and subscription header are stored with each batch job and forwarded to the model for authentication and rate limiting. The async-processor reaches the MaaS gateway via its **external hostname** (`https://maas.<cluster-domain>`) so that the certificate's SAN matches the hostname — the internal service DNS name does not match the certificate SAN. `asyncConfig.tls` points the async-processor at the `maas-gateway-ca` key of the credentials Secret for certificate verification.
+> **Note — image compatibility check**: the SQL transport requires `batch-gateway` and `llm-d-async` images built with SQL producer support, and the async-only operator release removed the legacy synchronous dispatch fields. An older platform/operator bundle can accept this CR and still fail at runtime, so verify the deployed image versions **before** selecting `asyncConfig.sql`:
+>
+> ```bash
+> # Operator and rendered workload images must come from an async-capable,
+> # SQL-producer-capable release (RHOAI 3.6 or the 3.6 operator chart)
+> $ kubectl get deploy llm-d-batch-gateway-operator -n redhat-ods-applications \
+>     -o jsonpath='{.spec.template.spec.containers[*].image}'
+> $ kubectl get deploy batch-gateway-async-processor -n batch-api \
+>     -o jsonpath='{.spec.template.spec.containers[*].image}'
+> ```
+>
+> If the async-processor image predates SQL producer support, `asyncConfig.sql` cannot dispatch — use a newer operator/platform release before applying the CR in this guide.
+
+`passThroughHeaders={Authorization,X-MaaS-Subscription}` ensures the API key and subscription header are stored with each batch job and forwarded to the model for authentication and rate limiting. **Credential boundary**: Authorino validates the API key at the MaaS gateway on each inference call and strips or replaces `Authorization` before the model backend, so the model never sees the raw credential — but the stored header **is** retained in PostgreSQL with the job records for the job retention period. Anyone with read access to the batch database (or its backups) can read the stored API keys; restrict database access accordingly and prefer short-lived API keys for batch workloads. The async-processor reaches the MaaS gateway via its **external hostname** (`https://maas.<cluster-domain>`) so that the certificate's SAN matches the hostname — the internal service DNS name does not match the certificate SAN. `asyncConfig.tls` points the async-processor at the `maas-gateway-ca` key of the credentials Secret for certificate verification.
 
 `asyncConfig.sql` selects the PostgreSQL dispatch transport. The processor and the async-processor both read the connection URL from the Secret's `postgresql-url` key, so no extra credentials are needed. `sql.maxConnections` caps the processor's SQL pool per replica (default 8) — budget `processor replicas × maxConnections` plus the async-processor's own pool against PostgreSQL `max_connections`.
 
@@ -320,6 +353,8 @@ EOF
 
 The `asyncConfig` block above is the minimum for MaaS: the queue name follows the `llm-d-async:requests:<inferencePoolName>` convention and must match the `modelGateways` entry, and the inference gateway URL points at the model's MaaS route. See the [RHOAI deployment guide](deploy-rhoai.md) for the full dispatch configuration reference (gates, worker pools, Prometheus integration).
 
+> **Note — flow control**: this guide assumes the model's `InferencePool` carries **batch-only traffic** (no direct MaaS model-inference requests). The `gateType: local-max-concurrency` gate only caps async worker concurrency; it does not assign a flow-control priority band or sheddability, so it provides **no priority separation** against direct inference traffic sharing the same pool. If direct and batch traffic share the `InferencePool`, set `modelGateways.<model>.inferenceObjective` (e.g. `batch-sheddable`) so the batch traffic lands in a sheddable low-priority band — see the [flow-control setup guide](flow-control-setup.md).
+
 > **Note — SQL result queues**: with the SQL transport the processor polls one result queue per model, and SQL result reads are destructive. Each model gateway entry must therefore resolve to its own result queue (default `llm-d-async:results:<inferencePoolName>`) and use a distinct `inferencePoolName`; setting only one of `requestQueueName` / `resultQueueName` is rejected. The SQL transport requires batch-gateway and llm-d-async images built with SQL producer support.
 
 Wait for the CR to become Ready (the operator deploys `<name>-apiserver`, `<name>-processor`, `<name>-async-processor`, `<name>-gc` and reports replica counts in the CR status):
@@ -359,6 +394,25 @@ EOF
 ### 4.5 HTTPRoute — created by the operator
 
 The manual HTTPRoute step is gone: with `spec.httpRoute.enabled: true` the operator creates an HTTPRoute named `<cr-name>-apiserver` attached to the gateways listed in `spec.httpRoute.parentRefs`, with path-prefix rules for `/v1/batches` and `/v1/files` and the apiserver Service as backend.
+
+#### Gateway route attachment (namespace labels)
+
+By default the MaaS gateway's listener only accepts HTTPRoutes from the same namespace, so the route created in `batch-api` is not accepted until the namespaces are allowed. Prefer a **label-based selector** over an exact namespace allow-list — it is less brittle as namespaces are added:
+
+1. Label **every** namespace that must attach to this Gateway — at minimum `batch-api` and `llm`, plus the MaaS infrastructure namespace (`redhat-ai-gateway-infra` / `odh-ai-gateway-infra`) and any application namespace already serving routes on it:
+
+```bash
+$ kubectl label namespace batch-api llm maas-gateway-access=true
+```
+
+2. Re-run `setup-gateway.sh` from the [models-as-a-service] checkout with the same `INGRESS_MODE` and the namespace selector labels:
+
+```bash
+$ cd /tmp/maas
+$ NAMESPACE_SELECTOR_LABELS=maas-gateway-access=true ./scripts/setup-gateway.sh
+```
+
+All existing route namespaces must be labeled **before** switching the listener selector, or their routes stop being accepted. Finally verify the route reports `Accepted=True`:
 
 ```bash
 $ kubectl get httproute batch-gateway-apiserver -n batch-api
@@ -700,6 +754,8 @@ The batch completing proves that `passThroughHeaders` works: the async-processor
 
 The async-processor authenticates to the model using the **original user's API key**, not a service account. By also forwarding `X-MaaS-Subscription`, users with multiple subscriptions can specify which subscription's token budget to use. If omitted, MaaS auto-selects the subscription (only works when the user has exactly one).
 
+**Gateway-to-backend credential boundary**: on each processor-initiated call, Authorino validates the forwarded API key at the MaaS gateway (step 6) and strips or replaces the `Authorization` header before the request reaches the model backend, so the model never sees the raw credential. On the storage side, the stored headers live in PostgreSQL with the job records for the job retention period — anyone with read access to the batch database (or its backups) can read the stored API keys, so restrict database access and prefer short-lived API keys for batch workloads.
+
 ## 8. Cleanup
 
 ```bash
@@ -729,6 +785,10 @@ $ oc delete user testuser
 $ oc delete identity htpasswd:testuser
 
 # Operators and MaaS platform (removes batch-gateway-operator and MaaS)
+# DESTRUCTIVE — fresh/test clusters only. This sets the shared DataScienceCluster
+# aigateway component to Removed and tears down MaaS/AI Gateway and operator
+# workloads that may be used by other applications. On any shared cluster, skip
+# this and delete only the resources created by this guide.
 $ kubectl patch datasciencecluster default-dsc --type merge \
     -p '{"spec":{"components":{"aigateway":{"managementState":"Removed"}}}}'
 ```
